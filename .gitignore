@@ -1,0 +1,28 @@
+# Rust
+/target
+**/target
+
+# Build outputs
+*.elf
+*.o
+*.bin
+*.efi
+busybox
+*.img
+*.iso
+
+# Logs
+*.log
+qemu_trace.log
+
+# Temporary
+scripts/*.tmp
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS specific
+.DS_Store

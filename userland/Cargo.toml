@@ -1,0 +1,28 @@
+[package]
+name = "userland"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "libuser"
+path = "src/lib.rs"
+
+[[bin]]
+name = "init"
+path = "src/bin/init.rs"
+
+[[bin]]
+name = "echo"
+path = "src/bin/echo.rs"
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+
+[[bin]]
+name = "mmap_test"
+path = "src/bin/mmap_test.rs"
+
+[[bin]]
+name = "dev_test"
+path = "src/bin/dev_test.rs"
