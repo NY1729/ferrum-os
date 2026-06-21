@@ -1,11 +1,12 @@
 use crate::allocator::PAGE_SIZE;
 use crate::process;
 use crate::serial_println;
-use crate::vma::{VMAFlags, VMAKind};
+use crate::vma::{ VMAFlags, VMAKind };
 use crate::ADDRESS_SPACE;
 
 macro_rules! run_test {
-    ($name:expr, $f:expr) => {{
+    ($name:expr, $f:expr) => {
+        {
         serial_println!("test: {}", $name);
 
         // 前提条件: 割り込みは禁止されているべき
@@ -28,10 +29,12 @@ macro_rules! run_test {
         }
 
         serial_println!("  {}: OK", $name);
-    }};
+        }
+    };
 }
 macro_rules! test_eq {
-    ($test:expr, $left:expr, $right:expr) => {{
+    ($test:expr, $left:expr, $right:expr) => {
+        {
         let left = $left;
         let right = $right;
         if left != right {
@@ -40,15 +43,18 @@ macro_rules! test_eq {
                 $test, left, right
             );
         }
-    }};
+        }
+    };
 }
 
 macro_rules! test_assert {
-    ($test:expr, $cond:expr, $msg:expr) => {{
+    ($test:expr, $cond:expr, $msg:expr) => {
+        {
         if !$cond {
             panic!("[{}] assertion failed: {}", $test, $msg);
         }
-    }};
+        }
+    };
 }
 
 pub fn run_all() {
@@ -105,17 +111,13 @@ fn heap_allocator() {
     let a2 = Box::new(1u64);
     let p1 = &*a1 as *const u64;
     let p2 = &*a2 as *const u64;
-    test_assert!(
-        "heap/distinct_ptrs",
-        p1 != p2,
-        "same pointer returned twice"
-    );
+    test_assert!("heap/distinct_ptrs", p1 != p2, "same pointer returned twice");
     drop(a1);
     drop(a2);
 }
 
 fn preemptive_scheduling() {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{ AtomicU64, Ordering };
 
     static COUNT_A: AtomicU64 = AtomicU64::new(0);
     static COUNT_B: AtomicU64 = AtomicU64::new(0);
@@ -164,12 +166,7 @@ fn preemptive_scheduling() {
     }
 
     serial_println!("  [1] getting kernel_pml4");
-    let kernel_pml4 = ADDRESS_SPACE
-        .lock()
-        .as_ref()
-        .unwrap()
-        .page_table
-        .pml4_phys();
+    let kernel_pml4 = ADDRESS_SPACE.lock().as_ref().unwrap().page_table.pml4_phys();
 
     serial_println!("  [2] resetting counters and scheduler");
     COUNT_A.store(0, Ordering::Relaxed);
@@ -185,25 +182,17 @@ fn preemptive_scheduling() {
             proc_a as *const () as u64,
             kernel_pml4,
             &raw mut SCHED_STACK_A as *mut u8,
-            32768,
+            32768
         );
         let pb = process::Process::new_with_static_stack(
             11,
             proc_b as *const () as u64,
             kernel_pml4,
             &raw mut SCHED_STACK_B as *mut u8,
-            32768,
+            32768
         );
-        (&raw mut TEST_SCHED)
-            .as_mut()
-            .unwrap()
-            .add_process(pa)
-            .expect("add proc_a failed");
-        (&raw mut TEST_SCHED)
-            .as_mut()
-            .unwrap()
-            .add_process(pb)
-            .expect("add proc_b failed");
+        (&raw mut TEST_SCHED).as_mut().unwrap().add_process(pa).expect("add proc_a failed");
+        (&raw mut TEST_SCHED).as_mut().unwrap().add_process(pb).expect("add proc_b failed");
     }
 
     // ここを追加：schedule より前に PREEMPT_SCHED_PTR を TEST_SCHED へ向ける
@@ -222,12 +211,8 @@ fn preemptive_scheduling() {
             (&raw const TEST_SCHED)
                 .as_ref()
                 .unwrap()
-                .processes
-                .iter()
-                .all(|p| {
-                    p.as_ref()
-                        .map_or(true, |p| p.state == process::ProcessState::Dead)
-                })
+                .processes.iter()
+                .all(|p| { p.as_ref().map_or(true, |p| p.state == process::ProcessState::Dead) })
         };
         if all_done {
             break;
@@ -267,19 +252,15 @@ fn demand_paging() {
     {
         let mut as_ = ADDRESS_SPACE.lock();
         let as_ = as_.as_mut().unwrap();
-        as_.mmap(
-            BASE,
-            PAGE_SIZE * PAGES as usize,
-            VMAFlags::rw(),
-            VMAKind::Anonymous,
-        )
-        .expect("mmap failed");
+        as_.mmap(BASE, PAGE_SIZE * (PAGES as usize), VMAFlags::rw(), VMAKind::Anonymous).expect(
+            "mmap failed"
+        );
     }
 
     // 書き込み（ページフォルトを誘発）
     unsafe {
         for i in 0..PAGES {
-            let ptr = (BASE + i * PAGE_SIZE as u64) as *mut u64;
+            let ptr = (BASE + i * (PAGE_SIZE as u64)) as *mut u64;
             core::ptr::write_volatile(ptr, 0xcafe_0000 + i);
         }
     }
@@ -287,53 +268,44 @@ fn demand_paging() {
     // 読み戻し検証
     unsafe {
         for i in 0..PAGES {
-            let ptr = (BASE + i * PAGE_SIZE as u64) as *const u64;
+            let ptr = (BASE + i * (PAGE_SIZE as u64)) as *const u64;
             let val = core::ptr::read_volatile(ptr);
-            test_eq!(
-                alloc::format!("demand_paging/page{}", i).as_str(),
-                val,
-                0xcafe_0000 + i
-            );
+            test_eq!(alloc::format!("demand_paging/page{}", i).as_str(), val, 0xcafe_0000 + i);
         }
     }
 }
 
 // 独立アドレス空間テスト
 fn isolated_address_spaces() {
-    use crate::paging::{phys_to_virt, PageAllocator, PageFlags, PageTableManager};
+    use crate::paging::{ phys_to_virt, PageAllocator, PageFlags, PageTableManager };
 
     const UTEST_VIRT: u64 = 0x0000_4000_0000;
-    const VAL_A: u64 = 0xAAAA_0000_AAAA_0000;
-    const VAL_B: u64 = 0xBBBB_0000_BBBB_0000;
+    const VAL_A: u64 = 0xaaaa_0000_aaaa_0000;
+    const VAL_B: u64 = 0xbbbb_0000_bbbb_0000;
 
-    let kernel_pml4 = ADDRESS_SPACE
-        .lock()
-        .as_ref()
-        .unwrap()
-        .page_table
-        .pml4_phys();
+    let kernel_pml4 = ADDRESS_SPACE.lock().as_ref().unwrap().page_table.pml4_phys();
 
     let page_flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER;
 
     // プロセスA: 独立PML4 + UTEST_VIRT にページをマップ
     let (pml4_a, phys_a) = {
         let mut alloc = crate::ALLOCATOR.lock();
-        let mut pt =
-            PageTableManager::new_user(kernel_pml4, &mut *alloc).expect("new_user A failed");
+        let mut pt = PageTableManager::new_user(kernel_pml4, &mut *alloc, 1).expect(
+            "new_user A failed"
+        );
         let (_, phys) = alloc.alloc_page().expect("alloc page A failed");
-        pt.map(UTEST_VIRT, phys, page_flags, &mut *alloc)
-            .expect("map A failed");
+        pt.map(UTEST_VIRT, phys, page_flags, &mut *alloc).expect("map A failed");
         (pt.pml4_phys(), phys)
     };
 
     // プロセスB: 独立PML4 + 同じ UTEST_VIRT に別ページをマップ
     let (pml4_b, phys_b) = {
         let mut alloc = crate::ALLOCATOR.lock();
-        let mut pt =
-            PageTableManager::new_user(kernel_pml4, &mut *alloc).expect("new_user B failed");
+        let mut pt = PageTableManager::new_user(kernel_pml4, &mut *alloc, 1).expect(
+            "new_user B failed"
+        );
         let (_, phys) = alloc.alloc_page().expect("alloc page B failed");
-        pt.map(UTEST_VIRT, phys, page_flags, &mut *alloc)
-            .expect("map B failed");
+        pt.map(UTEST_VIRT, phys, page_flags, &mut *alloc).expect("map B failed");
         (pt.pml4_phys(), phys)
     };
 
@@ -342,15 +314,11 @@ fn isolated_address_spaces() {
         pml4_a.as_u64(),
         phys_a.as_u64(),
         pml4_b.as_u64(),
-        phys_b.as_u64(),
+        phys_b.as_u64()
     );
 
     // 物理ページが別であることを確認
-    test_assert!(
-        "isolated_address_spaces/distinct_phys",
-        phys_a != phys_b,
-        "phys_a == phys_b!"
-    );
+    test_assert!("isolated_address_spaces/distinct_phys", phys_a != phys_b, "phys_a == phys_b!");
 
     // pml4_a の PML4 エントリを確認（デバッグ）
     unsafe {
@@ -405,18 +373,20 @@ fn isolated_address_spaces() {
             options(nostack),
         );
     }
-    serial_println!(
-        "[isolated_as] pml4_a: read={:#x} expected={:#x} {}",
-        read_a,
-        VAL_A,
-        if read_a == VAL_A { "OK" } else { "MISMATCH" }
-    );
-    serial_println!(
-        "[isolated_as] pml4_b: read={:#x} expected={:#x} {}",
-        read_b,
-        VAL_B,
-        if read_b == VAL_B { "OK" } else { "MISMATCH" }
-    );
+    serial_println!("[isolated_as] pml4_a: read={:#x} expected={:#x} {}", read_a, VAL_A, if
+        read_a == VAL_A
+    {
+        "OK"
+    } else {
+        "MISMATCH"
+    });
+    serial_println!("[isolated_as] pml4_b: read={:#x} expected={:#x} {}", read_b, VAL_B, if
+        read_b == VAL_B
+    {
+        "OK"
+    } else {
+        "MISMATCH"
+    });
     serial_println!("[isolated_as] restored kernel CR3");
 
     test_eq!("isolated_address_spaces/read_a", read_a, VAL_A);

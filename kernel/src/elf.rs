@@ -189,6 +189,7 @@ impl<'a> ElfLoader<'a> {
                 let phys: PhysAddr = allocator
                     .alloc(0)
                     .ok_or("ELF: out of memory for PT_LOAD page")?;
+                crate::page_owner::track(phys.as_u64(), 0, "elf:segment", as_.owner_pid);
 
                 // 仮想アドレス（higher-half経由）でゼロ埋め
                 let virt_ptr = crate::paging::phys_to_virt(phys.as_u64()) as *mut u8;

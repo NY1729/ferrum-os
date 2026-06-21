@@ -11,6 +11,7 @@ mod fs;
 mod gdt;
 mod heap;
 mod interrupts;
+mod page_owner;
 mod paging;
 mod pic;
 mod process;
@@ -88,6 +89,8 @@ pub extern "efiapi" fn efi_main(
 }
 
 fn kernel_main() -> uefi::Status {
+    x86_64::instructions::interrupts::disable();
+
     driver::serial::init();
     serial_println!("============================================================");
     serial_println!("Ferrum OS booting...");
@@ -127,6 +130,7 @@ fn kernel_main() -> uefi::Status {
 
     serial_println!("[main] exiting boot services...");
     let mmap = unsafe { uefi::boot::exit_boot_services(uefi::boot::MemoryType::LOADER_DATA) };
+    x86_64::instructions::interrupts::disable();
     serial_println!(
         "[main] boot services exited, memory map entries={}",
         mmap.entries().count()
@@ -135,6 +139,7 @@ fn kernel_main() -> uefi::Status {
     pic::init();
     pic::init_pit(100);
     apic::init();
+
     serial_println!("[main] interrupt controllers initialized");
 
     serial_println!("[main] setting up paging...");
@@ -150,8 +155,6 @@ fn kernel_main() -> uefi::Status {
     }
     serial_println!("[main] now running in higher half!");
 
-    x86_64::instructions::interrupts::disable();
-
     serial_println!("[main] initializing GDT...");
     gdt::init();
 
@@ -165,6 +168,7 @@ fn kernel_main() -> uefi::Status {
     apic::reload_higher_half();
 
     serial_println!("[main] enabling interrupts for APIC timer calibration...");
+    pic::unmask_irq0();
     x86_64::instructions::interrupts::enable();
 
     serial_println!("[main] calibrating APIC timer...");
@@ -176,6 +180,9 @@ fn kernel_main() -> uefi::Status {
     pic::mask_irq0();
     interrupts::PIT_MASKED.store(true, Ordering::Relaxed);
     serial_println!("[main] PIT masked, using APIC timer only");
+
+    serial_println!("[main] initializing page_owner");
+    crate::page_owner::init();
 
     serial_println!("[main] running kernel tests...");
     tests::run_all();
@@ -239,6 +246,15 @@ fn setup_paging(mmap: &uefi::mem::memory_map::MemoryMapOwned) {
     serial_println!("[main] setup_paging: mapping identity...");
     let mut identity_count = 0u32;
     for entry in mmap.entries() {
+        use ::uefi::mem::memory_map::MemoryType;
+        if entry.ty == MemoryType::RESERVED {
+            serial_println!(
+                "[main] setup_paging: skipping RESERVED region start={:#x} pages={}",
+                entry.phys_start,
+                entry.page_count
+            );
+            continue;
+        }
         let region = MemoryRegion {
             start: entry.phys_start,
             size: entry.page_count * (PAGE_SIZE as u64),
@@ -273,6 +289,10 @@ fn setup_paging(mmap: &uefi::mem::memory_map::MemoryMapOwned) {
     serial_println!("[main] setup_paging: mapping higher half...");
     let mut hh_count = 0u32;
     for entry in mmap.entries() {
+        use ::uefi::mem::memory_map::MemoryType;
+        if entry.ty == MemoryType::RESERVED {
+            continue;
+        }
         paging::map_higher_half_region(
             &mut pt_manager,
             &mut early_alloc,
@@ -348,7 +368,7 @@ fn setup_paging(mmap: &uefi::mem::memory_map::MemoryMapOwned) {
         alloc.dump();
     }
 
-    *ADDRESS_SPACE.lock() = Some(AddressSpace::new(pt_manager));
+    *ADDRESS_SPACE.lock() = Some(AddressSpace::new(pt_manager, 0));
     serial_println!("[main] setup_paging: AddressSpace initialized");
     serial_println!("[main] setup_paging: done");
 }
@@ -422,14 +442,14 @@ fn start_scheduler(image_size: u64, init_bytes: Option<&'static [u8]>) {
             // ELF 用の新しいユーザー PML4 を作成
             let mut pt = {
                 let mut alloc = ALLOCATOR.lock();
-                paging::PageTableManager::new_user(kernel_pml4, &mut *alloc)
+                paging::PageTableManager::new_user(kernel_pml4, &mut *alloc, 1)
                     .expect("ELF: new_user pt")
             };
 
             // ELF セグメントをロードする AddressSpace
             // pt と同じ PML4 を指す（from_phys で別インスタンス、同じ物理PML4）
             let mut as_ =
-                vma::AddressSpace::new(paging::PageTableManager::from_phys(pt.pml4_phys()));
+                vma::AddressSpace::new(paging::PageTableManager::from_phys(pt.pml4_phys()), 1);
 
             let entry = {
                 let loader = elf::ElfLoader::new(elf_data).expect("ElfLoader::new");
@@ -469,6 +489,7 @@ fn start_scheduler(image_size: u64, init_bytes: Option<&'static [u8]>) {
             crate::ALLOCATOR
                 .lock()
                 .check_metadata_integrity("after_elf_process_registered");
+            crate::page_owner::dump();
         } else {
             serial_println!("[main] no init ELF provided, nothing to run");
         }
@@ -560,13 +581,13 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 unsafe extern "C" fn jump_to_higher_half() {
     core::arch::naked_asm!(
         "mov rax, [rsp]",
-        "add rax, [{virt_base}]",
+        "add rax, [rip + {virt_base}]",
         "mov [rsp], rax",
         "mov rax, rsp",
-        "add rax, [{virt_base}]",
+        "add rax, [rip + {virt_base}]",
         "mov rsp, rax",
         "mov rax, rbp",
-        "add rax, [{virt_base}]",
+        "add rax, [rip + {virt_base}]",
         "mov rbp, rax",
         "ret",
         virt_base = sym paging::KERNEL_VIRT_BASE_STORAGE,

@@ -27,7 +27,7 @@ qemu-system-x86_64 \
     -drive format=raw,file=fat:rw:target/esp \
     -serial stdio \
     -display none \
-    -m 2G \
+    -m 4G \
     -no-reboot \
-    -no-shutdown 
-    
+    -no-shutdown \
+    -d int,guest_errors -D qemu_debug.log

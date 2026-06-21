@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::allocator::{ BuddyAllocator, PhysAddr };
+use crate::allocator::{BuddyAllocator, PhysAddr};
 use core::arch::asm;
 
 bitflags::bitflags! {
@@ -103,7 +103,11 @@ pub fn phys_to_virt(phys: u64) -> u64 {
 }
 
 pub fn ensure_virt(addr: u64) -> u64 {
-    if addr >= KERNEL_VIRT_BASE { addr } else { phys_to_virt(addr) }
+    if addr >= KERNEL_VIRT_BASE {
+        addr
+    } else {
+        phys_to_virt(addr)
+    }
 }
 
 pub fn virt_to_phys(virt: u64) -> u64 {
@@ -197,8 +201,13 @@ impl PageTableManager {
         Some(Self { pml4_phys })
     }
 
-    pub fn new_user(kernel_pml4_phys: PhysAddr, allocator: &mut dyn PageAllocator) -> Option<Self> {
+    pub fn new_user(
+        kernel_pml4_phys: PhysAddr,
+        allocator: &mut dyn PageAllocator,
+        owner_pid: crate::process::Pid,
+    ) -> Option<Self> {
         let (ptr, new_pml4_phys) = allocator.alloc_page()?;
+        crate::page_owner::track(new_pml4_phys.as_u64(), 0, "page-table:pml4", owner_pid);
         unsafe {
             let new_pml4 = ptr as *mut PageTable;
             let kern_pml4 = phys_to_virt(kernel_pml4_phys.as_u64()) as *const PageTable;
@@ -218,7 +227,7 @@ impl PageTableManager {
         phys_start: u64,
         size: u64,
         flags: PageFlags,
-        allocator: &mut dyn PageAllocator
+        allocator: &mut dyn PageAllocator,
     ) -> Option<()> {
         if size == 0 {
             return Some(());
@@ -247,7 +256,7 @@ impl PageTableManager {
         virt: u64,
         phys: PhysAddr,
         flags: PageFlags,
-        allocator: &mut dyn PageAllocator
+        allocator: &mut dyn PageAllocator,
     ) -> Option<()> {
         self.map_4kb(virt, phys, flags, allocator)
     }
@@ -257,7 +266,7 @@ impl PageTableManager {
         virt: u64,
         phys: PhysAddr,
         flags: PageFlags,
-        allocator: &mut dyn PageAllocator
+        allocator: &mut dyn PageAllocator,
     ) -> Option<()> {
         let parts = VirtAddrParts::from_u64(virt);
 
@@ -292,7 +301,7 @@ impl PageTableManager {
         virt: u64,
         phys: PhysAddr,
         flags: PageFlags,
-        allocator: &mut dyn PageAllocator
+        allocator: &mut dyn PageAllocator,
     ) -> Option<()> {
         let parts = VirtAddrParts::from_u64(virt);
 
@@ -311,10 +320,8 @@ impl PageTableManager {
             let pd_phys = ensure_table(&mut (*pdpt).entries[parts.pdpt], allocator, table_flags)?;
             let pd = allocator.phys_to_ptr(pd_phys) as *mut PageTable;
 
-            (*pd).entries[parts.pd] = PageTableEntry::new_page(
-                phys,
-                flags | PageFlags::PRESENT | PageFlags::HUGE
-            );
+            (*pd).entries[parts.pd] =
+                PageTableEntry::new_page(phys, flags | PageFlags::PRESENT | PageFlags::HUGE);
         }
         Some(())
     }
@@ -386,12 +393,17 @@ impl PageTableManager {
                 return None;
             }
 
-            Some(PhysAddr::new(e.phys_addr().as_u64() + (parts.offset as u64)))
+            Some(PhysAddr::new(
+                e.phys_addr().as_u64() + (parts.offset as u64),
+            ))
         }
     }
 
     pub unsafe fn load(&self) {
-        crate::serial_println!("[paging] load CR3: pml4_phys={:#x}", self.pml4_phys.as_u64());
+        crate::serial_println!(
+            "[paging] load CR3: pml4_phys={:#x}",
+            self.pml4_phys.as_u64()
+        );
         asm!("mov cr3, {}", in(reg) self.pml4_phys.as_u64());
     }
 
@@ -455,7 +467,7 @@ unsafe fn free_pt(phys: PhysAddr, alloc: &mut BuddyAllocator) {
 unsafe fn ensure_table(
     entry: &mut PageTableEntry,
     allocator: &mut dyn PageAllocator,
-    table_flags: PageFlags
+    table_flags: PageFlags,
 ) -> Option<PhysAddr> {
     if entry.is_present() {
         if entry.flags().contains(PageFlags::HUGE) {
@@ -499,7 +511,7 @@ pub fn flush_tlb_page(virt: u64) {
 pub fn map_identity(
     pt_manager: &mut PageTableManager,
     allocator: &mut dyn PageAllocator,
-    mmap: &[MemoryRegion]
+    mmap: &[MemoryRegion],
 ) -> Option<()> {
     for region in mmap {
         let start = region.start & !(SIZE_2MB - 1);
@@ -509,7 +521,7 @@ pub fn map_identity(
             start,
             end - start,
             PageFlags::PRESENT | PageFlags::WRITABLE,
-            allocator
+            allocator,
         )?;
     }
     Some(())
@@ -519,7 +531,7 @@ pub fn map_higher_half_region(
     pt_manager: &mut PageTableManager,
     allocator: &mut dyn PageAllocator,
     phys_start: u64,
-    size: u64
+    size: u64,
 ) -> Option<()> {
     let phys = phys_start & !(SIZE_2MB - 1);
     let end = (phys_start + size + SIZE_2MB - 1) & !(SIZE_2MB - 1);
@@ -528,7 +540,7 @@ pub fn map_higher_half_region(
         phys,
         end - phys,
         PageFlags::PRESENT | PageFlags::WRITABLE,
-        allocator
+        allocator,
     )
 }
 
@@ -536,7 +548,7 @@ pub fn map_higher_half(
     pt_manager: &mut PageTableManager,
     allocator: &mut dyn PageAllocator,
     image_base: u64,
-    image_size: u64
+    image_size: u64,
 ) -> Option<()> {
     map_higher_half_region(pt_manager, allocator, image_base, image_size)
 }
@@ -564,9 +576,13 @@ pub fn map_kernel_image(pt: &mut PageTableManager, image_base_phys: u64, image_s
     let mut addr = start;
     while addr < end {
         {
-            pt.map(addr, crate::allocator::PhysAddr::new(addr), flags, &mut *alloc).expect(
-                "map_kernel_image: map failed"
-            );
+            pt.map(
+                addr,
+                crate::allocator::PhysAddr::new(addr),
+                flags,
+                &mut *alloc,
+            )
+            .expect("map_kernel_image: map failed");
         }
         addr += 0x1000;
     }

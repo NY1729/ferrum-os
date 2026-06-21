@@ -31,33 +31,40 @@ pub fn init() {
         io_wait();
         outb(PIC2_CMD, ICW1_INIT);
         io_wait();
-
-        // Master: IRQ0-7 -> IDT 0x20-0x27
         outb(PIC1_DATA, 0x20);
         io_wait();
-        // Slave: IRQ8-15 -> IDT 0x28-0x2F
         outb(PIC2_DATA, 0x28);
         io_wait();
-
         outb(PIC1_DATA, 0x04);
         io_wait();
         outb(PIC2_DATA, 0x02);
         io_wait();
-
         outb(PIC1_DATA, ICW4_8086);
         io_wait();
         outb(PIC2_DATA, ICW4_8086);
         io_wait();
-
-        // IRQ0（タイマー）のみ許可、残りはマスク
-        outb(PIC1_DATA, 0b1111_1110);
+        outb(PIC1_DATA, 0b1111_1111);
         outb(PIC2_DATA, 0b1111_1111);
-
         let m1 = inb(PIC1_DATA);
         let m2 = inb(PIC2_DATA);
         crate::serial_println!("[pic] init: mask PIC1={:#010b} PIC2={:#010b}", m1, m2);
     }
     crate::serial_println!("[pic] init: done");
+}
+
+pub fn unmask_irq0() {
+    crate::serial_println!("[pic] unmask_irq0: unmasking PIT IRQ0");
+    unsafe {
+        let mut port = x86_64::instructions::port::Port::<u8>::new(0x21);
+        let before = port.read();
+        port.write(before & !0x01);
+        let after = port.read();
+        crate::serial_println!(
+            "[pic] unmask_irq0: PIC1 mask before={:#010b} after={:#010b}",
+            before,
+            after
+        );
+    }
 }
 
 #[inline(always)]

@@ -48,8 +48,7 @@ impl VfsNode for ProcfsNode {
 }
 
 pub fn format_maps(p: &Process) -> String {
-    let mut entries: Vec<crate::vma::VMA> =
-        p.address_space.vmas.iter().flatten().copied().collect();
+    let mut entries: Vec<crate::vma::VMA> = p.address_space.vmas.iter().copied().collect();
     entries.sort_by_key(|v| v.start);
 
     let mut out = String::new();
@@ -82,7 +81,6 @@ pub fn format_status(p: &Process) -> String {
         .address_space
         .vmas
         .iter()
-        .flatten()
         .map(|v| (v.end - v.start) / 1024)
         .sum();
 

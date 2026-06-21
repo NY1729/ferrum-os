@@ -2,6 +2,8 @@
 
 use crate::allocator::{BuddyAllocator, PAGE_SIZE};
 use crate::paging::{PageFlags, PageTableManager};
+use crate::process::Pid;
+use alloc::vec::Vec;
 
 // ── VMAFlags ─────────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,6 +55,16 @@ pub enum VMAKind {
     Heap,
 }
 
+impl VMAKind {
+    pub fn owner_tag(self) -> &'static str {
+        match self {
+            VMAKind::Anonymous => "vma:anon",
+            VMAKind::Stack => "vma:stack",
+            VMAKind::Heap => "vma:heap",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct VMA {
     pub start: u64,
@@ -76,21 +88,32 @@ impl VMA {
     pub fn size(&self) -> u64 {
         self.end - self.start
     }
+    /// 隣接(端点が一致)した時に1つに統合してよい属性かどうか。
+    fn mergeable_with(&self, other: &VMA) -> bool {
+        self.flags == other.flags && self.kind == other.kind
+    }
 }
 
 pub struct AddressSpace {
     pub page_table: PageTableManager,
-    pub vmas: [Option<VMA>; 64],
-    vma_count: usize,
+    /// start で常にソートされ、互いに重ならない VMA 一覧。
+    /// 不変条件: i < j ならば vmas[i].end <= vmas[j].start
+    pub vmas: Vec<VMA>,
+    pub owner_pid: Pid,
 }
 
 impl AddressSpace {
-    pub fn new(page_table: PageTableManager) -> Self {
+    pub fn new(page_table: PageTableManager, owner_pid: Pid) -> Self {
         Self {
             page_table,
-            vmas: [None; 64],
-            vma_count: 0,
+            vmas: Vec::new(),
+            owner_pid,
         }
+    }
+
+    /// `vmas[i].start >= start` となる最小の添字を返す（lower_bound）。
+    fn lower_bound(&self, start: u64) -> usize {
+        self.vmas.partition_point(|v| v.start < start)
     }
 
     pub fn add_vma(&mut self, vma: VMA) -> Result<(), &'static str> {
@@ -101,40 +124,70 @@ impl AddressSpace {
             vma.flags,
             vma.kind
         );
-        if self.vma_count >= 64 {
-            return Err("Too Many VMAs");
-        }
-        for existing in self.vmas.iter().flatten() {
-            if vma.start < existing.end && vma.end > existing.start {
+
+        let idx = self.lower_bound(vma.start);
+
+        // ソート済み・重なり無し不変条件があるので、前後2つだけ見れば
+        // 重なりチェックとして十分（Linuxの vma_merge と同じ考え方）。
+        if idx > 0 {
+            let prev = &self.vmas[idx - 1];
+            if prev.end > vma.start {
                 return Err("VMA overlap");
             }
         }
-        for slot in self.vmas.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(vma);
-                self.vma_count += 1;
-                return Ok(());
+        if idx < self.vmas.len() {
+            let next = &self.vmas[idx];
+            if vma.end > next.start {
+                return Err("VMA overlap");
             }
         }
-        Err("No free VMA slot")
+
+        let mut merged = vma;
+        let mut insert_idx = idx;
+
+        // 直前のVMAと連続していて属性が一致するなら統合
+        if insert_idx > 0 {
+            let prev = self.vmas[insert_idx - 1];
+            if prev.end == merged.start && prev.mergeable_with(&merged) {
+                merged.start = prev.start;
+                self.vmas.remove(insert_idx - 1);
+                insert_idx -= 1;
+            }
+        }
+        // 直後のVMAと連続していて属性が一致するなら統合
+        if insert_idx < self.vmas.len() {
+            let next = self.vmas[insert_idx];
+            if merged.end == next.start && merged.mergeable_with(&next) {
+                merged.end = next.end;
+                self.vmas.remove(insert_idx);
+            }
+        }
+
+        self.vmas.insert(insert_idx, merged);
+        Ok(())
     }
 
     pub fn find_vma(&self, addr: u64) -> Option<&VMA> {
-        self.vmas.iter().flatten().find(|vma| vma.contains(addr))
+        // start <= addr な最後の要素が候補（ソート済み・重なり無しなので一意）
+        let idx = self.vmas.partition_point(|v| v.start <= addr);
+        if idx == 0 {
+            return None;
+        }
+        let candidate = &self.vmas[idx - 1];
+        if candidate.contains(addr) {
+            Some(candidate)
+        } else {
+            None
+        }
     }
 
     pub fn remove_vma(&mut self, start: u64) -> Option<VMA> {
-        for slot in self.vmas.iter_mut() {
-            if let Some(vma) = slot {
-                if vma.start == start {
-                    let removed = *vma;
-                    *slot = None;
-                    self.vma_count -= 1;
-                    return Some(removed);
-                }
-            }
+        let idx = self.lower_bound(start);
+        if idx < self.vmas.len() && self.vmas[idx].start == start {
+            Some(self.vmas.remove(idx))
+        } else {
+            None
         }
-        None
     }
 
     pub fn handle_page_fault(
@@ -149,7 +202,6 @@ impl AddressSpace {
             page_addr
         );
 
-        // 既マップ済みの場合は TLB フラッシュだけして正常終了
         if self.page_table.translate(page_addr).is_some() {
             crate::serial_println!(
                 "[vma] handle_page_fault: page {:#x} already mapped, flushing TLB",
@@ -160,10 +212,7 @@ impl AddressSpace {
         }
 
         let vma = self
-            .vmas
-            .iter()
-            .flatten()
-            .find(|vma| vma.contains(fault_addr))
+            .find_vma(fault_addr)
             .copied()
             .ok_or("No VMA for fault address")?;
 
@@ -175,8 +224,8 @@ impl AddressSpace {
         );
 
         let phys = allocator.alloc(0).ok_or("Out of memory")?;
+        crate::page_owner::track(phys.as_u64(), 0, vma.kind.owner_tag(), self.owner_pid);
 
-        // 物理ページをゼロ初期化
         unsafe {
             let ptr = crate::paging::phys_to_virt(phys.as_u64()) as *mut u8;
             core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
@@ -186,7 +235,6 @@ impl AddressSpace {
             .map(page_addr, phys, vma.flags.to_page_flags(), allocator)
             .ok_or("Failed to map page")?;
 
-        // 新規マッピングは TLB キャッシュ不要だが、念のためフラッシュ
         crate::paging::flush_tlb_page(page_addr);
 
         crate::serial_println!(
@@ -238,9 +286,9 @@ impl AddressSpace {
 
         let mut page_addr = start;
         while page_addr < end {
-            // unmap() 内部で flush_tlb_page を呼んでいる
             if let Some(phys) = self.page_table.unmap(page_addr) {
                 allocator.free(phys, 0);
+                crate::page_owner::untrack(phys.as_u64());
             }
             page_addr += PAGE_SIZE as u64;
         }
@@ -248,22 +296,20 @@ impl AddressSpace {
         Ok(())
     }
 
-    // 全 VMA を unmap（物理ページ解放）し、VMA テーブルをクリアする。
+    // 全 VMA を unmap（物理ページ解放）し、VMA一覧をクリアする。
     pub fn clear_user(&mut self, alloc: &mut BuddyAllocator) {
-        for vma in self.vmas.iter().flatten() {
+        for vma in self.vmas.iter() {
             let mut addr = vma.start;
             while addr < vma.end {
-                // 1. translate して物理アドレスとフラグを取得
                 if let Some(phys) = self.page_table.translate(addr) {
-                    // translate を使ってマッピングが存在するか確認し、unmap を実行
                     alloc.free(phys, 0);
+                    crate::page_owner::untrack(phys.as_u64());
                     self.page_table.unmap(addr);
                 }
                 addr += PAGE_SIZE as u64;
             }
         }
-        self.vmas = [None; 64];
-        self.vma_count = 0;
+        self.vmas.clear();
         crate::paging::flush_tlb();
     }
 
@@ -275,9 +321,7 @@ impl AddressSpace {
     ) -> Result<u64, &'static str> {
         let loader = match crate::elf::ElfLoader::new(data) {
             Ok(l) => l,
-            Err(e) => {
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
 
         let pt = unsafe { &mut *(&mut self.page_table as *mut crate::paging::PageTableManager) };
@@ -305,21 +349,21 @@ impl AddressSpace {
         self.page_table.unmap(temp_virt).expect("temp unmap failed");
     }
 
-    // vma.rs
     pub fn destroy(&mut self, alloc: &mut BuddyAllocator) {
-        for vma in self.vmas.iter().flatten().copied() {
+        for vma in self.vmas.iter().copied() {
             let mut addr = vma.start;
             while addr < vma.end {
                 if let Some(phys) = self.page_table.unmap(addr) {
                     alloc.free(phys, 0);
+                    crate::page_owner::untrack(phys.as_u64());
                 }
                 addr += PAGE_SIZE as u64;
             }
         }
-        self.vmas = [None; 64];
-        self.vma_count = 0;
+        self.vmas.clear();
         self.page_table.free_user_tables(alloc);
         alloc.free(self.page_table.pml4_phys(), 0);
+        crate::page_owner::untrack(self.page_table.pml4_phys().as_u64());
         crate::paging::flush_tlb();
     }
 
@@ -329,33 +373,36 @@ impl AddressSpace {
         hole_end: u64,
         alloc: &mut BuddyAllocator,
     ) -> Result<(), &'static str> {
-        let mut overlapping: [Option<VMA>; 64] = [None; 64];
-        let mut n = 0;
-
-        for vma in self.vmas.iter().flatten() {
-            if hole_start < vma.end && hole_end > vma.start {
-                overlapping[n] = Some(*vma);
-                n += 1;
-            }
+        // hole と重なりうる最初のVMAを二分探索で特定
+        let mut i = self.lower_bound(hole_start);
+        if i > 0 && self.vmas[i - 1].end > hole_start {
+            i -= 1;
         }
 
-        for slot in overlapping.iter().take(n) {
-            let vma = slot.unwrap();
+        let mut overlapping: Vec<VMA> = Vec::new();
+        while i < self.vmas.len() && self.vmas[i].start < hole_end {
+            overlapping.push(self.vmas[i]);
+            i += 1;
+        }
+
+        for vma in overlapping {
             self.remove_vma(vma.start);
 
-            // 重なっている部分の物理ページを解放
             let mut addr = core::cmp::max(vma.start, hole_start);
             let clip_end = core::cmp::min(vma.end, hole_end);
             while addr < clip_end {
                 if let Some(phys) = self.page_table.unmap(addr) {
                     alloc.free(phys, 0);
+                    crate::page_owner::untrack(phys.as_u64());
                 }
                 addr += PAGE_SIZE as u64;
             }
 
+            // 左残り: [vma.start, hole_start)
             if vma.start < hole_start {
-                self.add_vma(VMA::new(vma.start, hole_end, vma.flags, vma.kind))?;
+                self.add_vma(VMA::new(vma.start, hole_start, vma.flags, vma.kind))?;
             }
+            // 右残り: [hole_end, vma.end)
             if vma.end > hole_end {
                 self.add_vma(VMA::new(hole_end, vma.end, vma.flags, vma.kind))?;
             }
@@ -364,8 +411,6 @@ impl AddressSpace {
         Ok(())
     }
 
-    // 指定アドレスへ強制的にマッピングする
-    // 既存の重なるVMAがあれば穴をあけてから新しい VMA を追加する。
     pub fn mmap_fixed(
         &mut self,
         addr: u64,
@@ -391,7 +436,7 @@ impl AddressSpace {
     pub fn extend_heap(&mut self, brk_start: u64, new_end: u64) -> Result<(), &'static str> {
         let mut best_start: Option<u64> = None;
         let mut best_end = 0u64;
-        for vma in self.vmas.iter().flatten() {
+        for vma in self.vmas.iter() {
             if vma.kind == VMAKind::Heap && vma.end > best_end {
                 best_end = vma.end;
                 best_start = Some(vma.start);
@@ -408,36 +453,23 @@ impl AddressSpace {
     }
 
     // 匿名mmap用ゾーン内から、十分な大きさの空きギャップを探す。
+    // vmas は既にソート済みなので、ゾーン内を1パス走査するだけでよい。
     fn find_free_area(&self, size: u64) -> Option<u64> {
         const MMAP_ZONE_START: u64 = 0x0000_6000_0000_0000;
         const MMAP_ZONE_END: u64 = 0x0000_7000_0000_0000;
 
-        let mut zone_vmas: [(u64, u64); 64] = [(0, 0); 64];
-        let mut n = 0;
-        for vma in self.vmas.iter().flatten() {
-            if vma.start >= MMAP_ZONE_START && vma.end <= MMAP_ZONE_END {
-                zone_vmas[n] = (vma.start, vma.end);
-                n += 1;
-            }
-        }
-
-        for i in 1..n {
-            let key = zone_vmas[i];
-            let mut j = i;
-            while j > 0 && zone_vmas[j - 1].0 > key.0 {
-                zone_vmas[j] = zone_vmas[j - 1];
-                j -= 1;
-            }
-            zone_vmas[j] = key;
-        }
-
         let mut cursor = MMAP_ZONE_START;
-        for i in 0..n {
-            let (vstart, vend) = zone_vmas[i];
-            if vstart.saturating_sub(cursor) >= size {
+        for vma in self.vmas.iter() {
+            if vma.start >= MMAP_ZONE_END {
+                break;
+            }
+            if vma.end <= MMAP_ZONE_START {
+                continue;
+            }
+            if vma.start.saturating_sub(cursor) >= size {
                 return Some(cursor);
             }
-            cursor = core::cmp::max(cursor, vend);
+            cursor = core::cmp::max(cursor, vma.end);
         }
         if MMAP_ZONE_END.saturating_sub(cursor) >= size {
             Some(cursor)

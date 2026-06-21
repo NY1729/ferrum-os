@@ -98,7 +98,7 @@ impl Process {
             context: ctx,
             kernel_stack_alloc: None,
             kernel_stack_top: stack_top,
-            address_space: AddressSpace::new(PageTableManager::from_phys(kernel_pml4)),
+            address_space: AddressSpace::new(PageTableManager::from_phys(kernel_pml4), 0),
             fd_table: FdTable::new_stdio(),
             fs_base: 0,
             brk_start: 0,
@@ -118,7 +118,7 @@ impl Process {
     ) -> Option<Self> {
         let mut pt = {
             let mut alloc = crate::ALLOCATOR.lock();
-            PageTableManager::new_user(kernel_pml4, &mut *alloc)?
+            PageTableManager::new_user(kernel_pml4, &mut *alloc, pid)?
         };
 
         {
@@ -129,6 +129,7 @@ impl Process {
             for i in 0..ustack_pages {
                 let page_virt = ustack_base + (i as u64) * 0x1000;
                 let (_, phys) = alloc.alloc_page()?;
+                crate::page_owner::track(phys.as_u64(), 0, "proc:stack", pid);
                 pt.map(page_virt, phys, flags, &mut *alloc)?;
             }
         }
@@ -169,7 +170,7 @@ impl Process {
             context: ctx,
             kernel_stack_alloc: None,
             kernel_stack_top: kstack_top,
-            address_space: AddressSpace::new(pt),
+            address_space: AddressSpace::new(pt, pid),
             fd_table: FdTable::new_stdio(),
             fs_base: 0,
             brk_start: 0,
@@ -200,6 +201,7 @@ impl Process {
             for i in 0..ustack_pages {
                 let page_virt = ustack_base + (i as u64) * 0x1000;
                 let (_, phys) = alloc.alloc_page()?;
+                crate::page_owner::track(phys.as_u64(), 0, "proc:stack", pid);
                 address_space
                     .page_table
                     .map(page_virt, phys, flags, &mut *alloc)?;
@@ -282,7 +284,9 @@ impl Process {
         // 子のカーネルスタックを buddy から確保
         let kstack_phys = {
             let mut alloc = crate::ALLOCATOR.lock();
-            alloc.alloc(3)?
+            let phys = alloc.alloc(3)?;
+            crate::page_owner::track(phys.as_u64(), 3, "proc:stack", new_pid);
+            phys
         };
         let kstack_virt = phys_to_virt(kstack_phys.as_u64()) as *mut u8;
         let kstack_len = 4096 * 8;
@@ -323,15 +327,16 @@ impl Process {
 
         let mut child_pt = {
             let mut alloc = crate::ALLOCATOR.lock();
-            PageTableManager::new_user(kernel_pml4, &mut *alloc)?
+            PageTableManager::new_user(kernel_pml4, &mut *alloc, new_pid)?
         };
 
-        let mut child_as = AddressSpace::new(PageTableManager::from_phys(child_pt.pml4_phys()));
+        let mut child_as =
+            AddressSpace::new(PageTableManager::from_phys(child_pt.pml4_phys()), new_pid);
 
         // 親のユーザーページをコピー
         {
             let mut alloc = crate::ALLOCATOR.lock();
-            for vma in self.address_space.vmas.iter().flatten().copied() {
+            for vma in self.address_space.vmas.iter().copied() {
                 child_as.add_vma(vma).ok()?;
                 let mut addr = vma.start;
                 while addr < vma.end {
@@ -343,6 +348,12 @@ impl Process {
                         );
 
                         let (_, dst_phys) = alloc.alloc_page().expect("fork: OOM during copy");
+                        crate::page_owner::track(
+                            dst_phys.as_u64(),
+                            0,
+                            vma.kind.owner_tag(),
+                            new_pid,
+                        );
 
                         if src_phys.as_u64() == dst_phys.as_u64() {
                             panic!(
@@ -490,6 +501,7 @@ impl Scheduler {
                         old.address_space.destroy(&mut alloc);
                         if let Some((kphys, order)) = old.kernel_stack_alloc {
                             alloc.free(kphys, order);
+                            crate::page_owner::untrack(kphys.as_u64());
                         }
                     }
                 }

@@ -688,7 +688,7 @@ fn syscall_execve(frame: &mut SyscallFrame) -> u64 {
 
     {
         let mut highest_end = 0u64;
-        for vma in p.address_space.vmas.iter().flatten() {
+        for vma in p.address_space.vmas.iter() {
             if vma.kind != crate::vma::VMAKind::Stack && vma.end > highest_end {
                 highest_end = vma.end;
             }
