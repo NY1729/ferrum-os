@@ -41,6 +41,7 @@ impl Context {
 pub enum ProcessState {
     Ready,
     Running,
+    Waiting,
     Blocked,
     Dead,
 }
@@ -220,7 +221,7 @@ impl Process {
                 .ok()?;
         }
 
-        let initial_rsp = crate::syscall::build_argv_envp_stack(
+        let (initial_rsp, at_random) = crate::syscall::build_argv_envp_stack(
             ustack_virt,
             &address_space.page_table,
             argv,
@@ -230,6 +231,58 @@ impl Process {
             elf_phent,
             elf_phnum,
         );
+
+        // 仮 TCB を設定（スタックの外に配置）
+        let tcb_page = 0x0000_7fff_1000u64;
+        let fs_base = tcb_page + 0x20;
+        {
+            let mut alloc = crate::ALLOCATOR.lock();
+            if let Some((_, tcb_phys)) = alloc.alloc_page() {
+                let virt = crate::paging::phys_to_virt(tcb_phys.as_u64());
+                unsafe {
+                    core::ptr::write_bytes(virt as *mut u8, 0, 0x1000);
+                }
+
+                let flags =
+                    PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXEC;
+                address_space
+                    .page_table
+                    .map(tcb_page, tcb_phys, flags, &mut *alloc);
+                address_space
+                    .add_vma(crate::vma::VMA::new(
+                        tcb_page,
+                        tcb_page + 0x1000,
+                        crate::vma::VMAFlags {
+                            read: true,
+                            write: true,
+                            exec: false,
+                        },
+                        crate::vma::VMAKind::Anonymous,
+                    ))
+                    .ok();
+
+                // self ポインタ（fs_base の offset 0 = tcb_page+0x20）
+                let phys_off = (fs_base & 0xFFF) as usize;
+                unsafe {
+                    *((virt + phys_off as u64) as *mut u64) = fs_base;
+                    // offset 0x10
+                    *((virt + phys_off as u64 + 0x10) as *mut u64) = fs_base;
+                }
+            }
+        }
+
+        let canary = u64::from_le_bytes(at_random[0..8].try_into().unwrap());
+        let phys_off = ((fs_base + 0x28) & 0xFFF) as usize;
+        let tcb_virt = crate::paging::phys_to_virt(
+            address_space
+                .page_table
+                .translate(tcb_page)
+                .unwrap()
+                .as_u64(),
+        );
+        unsafe {
+            *((tcb_virt + phys_off as u64) as *mut u64) = canary;
+        }
 
         let kstack_top = (kstack as u64) + (kstack_len as u64);
         unsafe {
@@ -251,7 +304,7 @@ impl Process {
 
         crate::serial_println!(
             "[process] new_user_with_address_space pid={} entry={:#x} \
-             kstack=[{:#x},{:#x}) ustack_top={:#x} pml4={:#x}",
+         kstack=[{:#x},{:#x}) ustack_top={:#x} pml4={:#x}",
             pid,
             entry_point,
             kstack as u64,
@@ -270,7 +323,7 @@ impl Process {
             kernel_stack_top: kstack_top,
             address_space,
             fd_table: FdTable::new_stdio(),
-            fs_base: 0,
+            fs_base,
             brk_start: 0,
             brk_current: 0,
             cwd: alloc::string::String::from("/"),
@@ -404,13 +457,6 @@ impl Process {
             .lock()
             .check_metadata_integrity("after_elf_process_registered");
 
-        crate::serial_println!(
-            "[process] fork: parent_pid={} -> child_pid={} child_pml4={:#x}",
-            self.pid,
-            new_pid,
-            child_as.page_table.pml4_phys().as_u64()
-        );
-
         Some(Process {
             pid: new_pid,
             parent_pid: self.pid,
@@ -424,7 +470,7 @@ impl Process {
             fs_base: self.fs_base,
             brk_start: self.brk_start,
             brk_current: self.brk_current,
-            cwd: alloc::string::String::from("/"),
+            cwd: self.cwd.clone(),
         })
     }
 }
@@ -433,38 +479,62 @@ impl Process {
 // do_switch の ret からここに飛び、リング3へ切り替える。
 #[unsafe(naked)]
 pub unsafe extern "C" fn iretq_trampoline() -> ! {
-    naked_asm!(
-        "mov ax, 0x2B",
-        "mov ds, ax",
-        "mov es, ax",
-        "mov fs, ax",
-        "iretq"
-    );
+    naked_asm!("mov ax, 0x2B", "mov ds, ax", "mov es, ax", "iretq");
 }
 
 #[unsafe(naked)]
 pub unsafe extern "C" fn fork_child_trampoline() -> ! {
     naked_asm!(
-        "pop r15", // [frame+0x00]
-        "pop r14", // [frame+0x08]
-        "pop r13", // [frame+0x10]
-        "pop r12", // [frame+0x18]
-        "pop rbp", // [frame+0x20] user rbp
-        "pop rbx", // [frame+0x28]
-        "pop r9",  // [frame+0x30]
-        "pop r8",  // [frame+0x38]
-        "pop r10", // [frame+0x40]
-        "pop rdx", // [frame+0x48]
-        "pop rsi", // [frame+0x50]
-        "pop rdi", // [frame+0x58]
-        "pop rax", // [frame+0x60] rax=0 → 子の fork() 戻り値として実レジスタにロード
-        // rsp = frame+0x68 = [user_rsp]
-        "mov rcx, [rsp + 16]", // user_rip  → rcx (frame+0x78)
-        "mov r11, [rsp + 8]",  // user_rflags → r11 (frame+0x70)
-        "mov rsp, [rsp]",      // user_rsp  → rsp
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "pop r9",
+        "pop r8",
+        "pop r10",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rax",
+        // レジスタを保存して fs_base を設定
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "sub rsp, 8",       // アライメント
+        "call {setup_fs}",
+        "add rsp, 8",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "mov rcx, [rsp + 16]",
+        "mov r11, [rsp + 8]",
+        "mov rsp, [rsp]",
         "swapgs",
-        "sysretq" // ユーザー空間で fork() == 0 が返る (RAX=0)
+        "sysretq",
+        setup_fs = sym setup_child_fs,
     );
+}
+
+extern "sysv64" fn setup_child_fs() {
+    let sched = unsafe { &*&raw const crate::SCHEDULER };
+    let fs_base = sched.current().map(|p| p.fs_base).unwrap_or(0);
+    unsafe {
+        crate::syscall::write_fs_base(fs_base);
+    }
 }
 
 pub struct Scheduler {
@@ -487,16 +557,13 @@ impl Scheduler {
     }
 
     pub fn add_process(&mut self, p: Process) -> Option<()> {
-        for (i, slot) in self.processes.iter_mut().enumerate() {
+        for slot in self.processes.iter_mut() {
             if slot.is_none() {
-                crate::serial_println!("[sched] add: pid={} slot[{}]", p.pid, i);
                 *slot = Some(p);
                 return Some(());
             }
         }
 
-        let i = self.processes.len();
-        crate::serial_println!("[sched] add: pid={} slot[{}] (grown)", p.pid, i);
         self.processes.push(Some(p));
         Some(())
     }
@@ -595,7 +662,6 @@ pub unsafe extern "C" fn do_switch(prev: *mut Context, next: *const Context) {
 
 pub fn schedule(scheduler: *mut Scheduler) {
     x86_64::instructions::interrupts::disable();
-
     let sched = unsafe { &mut *scheduler };
 
     // Ready プロセスが存在するか（Running 中のものは含まない）
@@ -644,7 +710,6 @@ pub fn schedule(scheduler: *mut Scheduler) {
                 core::arch::asm!(
                     "mov cr3, {cr3}",
                     "call {f}",
-                    "sti",
                     cr3          = in(reg) next_pml4,
                     inout("rdi") prev     => _,
                     inout("rsi") next     => _,
@@ -680,12 +745,6 @@ pub fn schedule(scheduler: *mut Scheduler) {
         }
     };
 
-    // 同一プロセスへの切り替えはスキップ
-    if (prev as *const Context) == next {
-        x86_64::instructions::interrupts::enable();
-        return;
-    }
-
     // TSS のカーネルスタックと syscall_entry の RSP を更新
     crate::gdt::set_kernel_stack(next_kstack_top);
     crate::syscall::update_kernel_rsp(next_kstack_top);
@@ -694,7 +753,6 @@ pub fn schedule(scheduler: *mut Scheduler) {
         core::arch::asm!(
             "mov cr3, {cr3}",
             "call {f}",
-            "sti",
             cr3          = in(reg) next_pml4,
             inout("rdi") prev     => _,
             inout("rsi") next     => _,
@@ -714,6 +772,7 @@ pub fn schedule(scheduler: *mut Scheduler) {
     }
 
     let restored_fs_base = sched.current_mut().map(|p| p.fs_base).unwrap_or(0);
+
     unsafe {
         crate::syscall::write_fs_base(restored_fs_base);
     }

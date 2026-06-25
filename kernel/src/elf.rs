@@ -99,13 +99,6 @@ impl<'a> ElfLoader<'a> {
             return Err("ELF: program header table out of bounds");
         }
 
-        crate::serial_println!(
-            "[elf] ELF64 validated: entry={:#x} phnum={} phoff={:#x}",
-            { ehdr.e_entry },
-            phnum,
-            phoff,
-        );
-
         Ok(Self { data, ehdr })
     }
 
@@ -134,15 +127,6 @@ impl<'a> ElfLoader<'a> {
             let p_offset = { phdr.p_offset };
             let p_flags = { phdr.p_flags };
 
-            crate::serial_println!(
-                "[elf] PT_LOAD[{}]: vaddr={:#x} filesz={:#x} memsz={:#x} flags={:#x}",
-                i,
-                p_vaddr,
-                p_filesz,
-                p_memsz,
-                p_flags,
-            );
-
             if p_memsz == 0 {
                 continue;
             }
@@ -163,14 +147,6 @@ impl<'a> ElfLoader<'a> {
             let map_start = align_down(p_vaddr, PAGE_SIZE as u64);
             let map_end = align_up(p_vaddr + p_memsz, PAGE_SIZE as u64);
             let map_pages = ((map_end - map_start) / PAGE_SIZE as u64) as usize;
-
-            crate::serial_println!(
-                "[elf]   map [{:#x}, {:#x}) {} pages flags={:?}",
-                map_start,
-                map_end,
-                map_pages,
-                vma_flags,
-            );
 
             // VMA 登録
             as_.add_vma(crate::vma::VMA::new(
@@ -234,7 +210,6 @@ impl<'a> ElfLoader<'a> {
         }
 
         let entry = { self.ehdr.e_entry };
-        crate::serial_println!("[elf] load complete: entry={:#x}", entry);
         Ok(entry)
     }
 }

@@ -74,6 +74,7 @@ pub fn format_status(p: &Process) -> String {
         ProcessState::Running | ProcessState::Ready => "R (running)",
         ProcessState::Blocked => "S (sleeping)",
         ProcessState::Dead => "Z (zombie)",
+        ProcessState::Waiting => "W (waiting)",
     };
 
     let heap_kb = p.brk_current.saturating_sub(p.brk_start) / 1024;

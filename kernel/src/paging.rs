@@ -488,7 +488,6 @@ unsafe fn ensure_table(
         }
         (*(ptr as *mut PageTable)).zero();
         *entry = PageTableEntry::new_table(phys, table_flags);
-        crate::serial_println!("[paging] allocated new table at phys={:#x}", phys.as_u64());
         Some(phys)
     }
 }
@@ -567,11 +566,7 @@ pub fn map_kernel_image(pt: &mut PageTableManager, image_base_phys: u64, image_s
     let mut alloc = crate::ALLOCATOR.lock();
     let start = image_base_phys & !0xfff;
     let end = (image_base_phys + image_size + 0xfff) & !0xfff;
-    crate::serial_println!(
-        "[paging] map_kernel_image: [{:#x}, {:#x}) SUPERVISOR+WRITABLE",
-        start,
-        end
-    );
+
     let mut addr = start;
     while addr < end {
         {

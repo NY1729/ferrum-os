@@ -2,6 +2,8 @@
 use crate::fs::vfs::Vfs;
 use crate::paging::PageAllocator;
 use crate::process::ProcessState;
+
+use alloc::sync::Arc;
 use core::arch::asm;
 
 #[no_mangle]
@@ -24,6 +26,10 @@ pub fn init() {
              in("eax") gs_base as u32, in("edx") (gs_base >> 32) as u32, options(nostack));
         crate::serial_println!("[syscall] GS.base={:#x}", gs_base);
     }
+}
+
+pub unsafe fn read_fs_base() -> u64 {
+    x86_64::registers::model_specific::FsBase::read().as_u64()
 }
 
 unsafe fn enable_syscall_msr() {
@@ -149,6 +155,7 @@ pub mod nr {
     pub const PREAD64: u64 = 17;
     pub const WRITEV: u64 = 20;
     pub const ACCESS: u64 = 21;
+    pub const PIPE: u64 = 22;
     pub const YIELD: u64 = 24;
     pub const DUP: u64 = 32;
     pub const DUP2: u64 = 33;
@@ -184,12 +191,14 @@ pub mod nr {
     pub const CLOCK_GETRES: u64 = 229;
     pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const EXIT_GROUP: u64 = 231;
+    pub const TGKILL: u64 = 234;
     pub const OPENAT: u64 = 257;
     pub const NEWFSTATAT: u64 = 262;
     pub const UNLINKAT: u64 = 263;
     pub const READLINKAT: u64 = 267;
     pub const FACCESSAT: u64 = 269;
     pub const SET_ROBUST_LIST: u64 = 273;
+    pub const PIPE2: u64 = 293;
     pub const PRLIMIT64: u64 = 302;
     pub const GETRANDOM: u64 = 318;
     pub const STATX: u64 = 332;
@@ -202,6 +211,7 @@ pub mod nr {
 }
 
 pub extern "sysv64" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
+    x86_64::instructions::interrupts::disable();
     let nr = frame.rax;
 
     match nr {
@@ -214,12 +224,11 @@ pub extern "sysv64" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
         nr::NEWFSTATAT => syscall_newfstatat(frame),
         nr::FCNTL => syscall_fcntl(frame),
         nr::GETPID => unsafe {
-            (&raw mut crate::SCHEDULER)
-                .as_mut()
-                .unwrap()
-                .current_mut()
-                .map(|p| p.pid)
-                .unwrap_or(0)
+            let sched = &mut *&raw mut crate::SCHEDULER;
+            let idx = sched.current_idx();
+            let pid = sched.current_mut().map(|p| p.pid).unwrap_or(0);
+            crate::serial_println!("[getpid] current_idx={} pid={}", idx, pid);
+            pid
         },
         nr::GETPPID => unsafe {
             (&raw mut crate::SCHEDULER)
@@ -231,7 +240,17 @@ pub extern "sysv64" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
         },
         nr::GETEUID => 0, // ルートユーザーとして振る舞う
         nr::GETCWD => syscall_getcwd(frame),
-        nr::FORK | nr::CLONE => syscall_fork(frame),
+        nr::FORK => syscall_fork(frame),
+        nr::CLONE => {
+            let flags = frame.rdi;
+            crate::serial_println!("[clone] flags={:#x}", flags);
+            const CLONE_THREAD: u64 = 0x10000;
+            if flags & CLONE_THREAD != 0 {
+                crate::serial_println!("[clone] CLONE_THREAD → ENOSYS");
+                return (-38i64) as u64;
+            }
+            syscall_fork(frame)
+        }
         nr::WAIT4 => syscall_wait4(frame),
         nr::CHDIR => syscall_chdir(frame),
         nr::MKDIR => syscall_mkdir(frame),
@@ -246,9 +265,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
         nr::EXECVE => syscall_execve(frame),
         nr::EXIT | nr::EXIT_GROUP => syscall_exit(frame),
         nr::YIELD => {
-            x86_64::instructions::interrupts::enable();
             crate::process::schedule(&raw mut crate::SCHEDULER);
-            x86_64::instructions::interrupts::disable();
             0
         }
         nr::MMAP => syscall_mmap(frame),
@@ -275,6 +292,38 @@ pub extern "sysv64" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
                 write_to_user(sched, tloc as u64, &sec.to_ne_bytes());
             }
             sec
+        }
+        nr::TGKILL => {
+            let tgid = frame.rdi as u64;
+            let sig = frame.rdx as u64;
+            crate::serial_println!("[tgkill] tgid={} tid={} sig={}", tgid, frame.rsi, sig);
+
+            let sched = unsafe { &mut *&raw mut crate::SCHEDULER };
+
+            // tgid に一致するプロセスを Dead にする
+            for slot in sched.processes.iter_mut() {
+                if let Some(p) = slot {
+                    if p.pid as u64 == tgid {
+                        p.state = ProcessState::Dead;
+                        for fd in 0..crate::fd::FD_MAX {
+                            p.fd_table.close(fd);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // 現在実行中のプロセスが tgid と同じなら schedule
+            let current_pid = sched.current_mut().map(|p| p.pid as u64).unwrap_or(0);
+            if current_pid == tgid {
+                crate::process::schedule(&raw mut crate::SCHEDULER);
+                loop {
+                    x86_64::instructions::interrupts::enable();
+                    x86_64::instructions::hlt();
+                }
+            }
+
+            0
         }
         nr::ARCH_PRCTL => syscall_arch_prctl(frame),
         nr::WRITEV => syscall_writev(frame),
@@ -306,6 +355,7 @@ pub extern "sysv64" fn syscall_handler(frame: &mut SyscallFrame) -> u64 {
             }
             0
         }
+        nr::PIPE | nr::PIPE2 => syscall_pipe(frame),
         nr::LSEEK => syscall_lseek(frame),
         nr::OPENAT => syscall_openat(frame),
         nr::READLINKAT => (-2i64) as u64, // ENOENT
@@ -385,6 +435,7 @@ fn syscall_read(frame: &mut SyscallFrame) -> u64 {
                     break;
                 }
             }
+            x86_64::instructions::interrupts::disable();
             n as u64
         }
         crate::fd::FdKind::File => {
@@ -410,10 +461,34 @@ fn syscall_read(frame: &mut SyscallFrame) -> u64 {
             user_buf.fill(0);
             count as u64
         }
+        crate::fd::FdKind::Pipe => {
+            let pipe = {
+                let desc = entry.lock();
+                desc.pipe.as_ref().expect("Pipe fd must have pipe").clone()
+            };
+            loop {
+                let mut inner = pipe.lock();
+                if !inner.buf.is_empty() {
+                    let n = inner.buf.len().min(count);
+                    let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, n) };
+                    for b in user_buf.iter_mut() {
+                        *b = inner.buf.pop_front().unwrap();
+                    }
+                    return n as u64;
+                }
+                if inner.write_ends == 0 {
+                    return 0; // EOF
+                }
+                drop(inner);
+                // ライター待ち: スケジュールアウト
+                crate::process::schedule(&raw mut crate::SCHEDULER);
+            }
+        }
     }
 }
 
 fn syscall_write(frame: &mut SyscallFrame) -> u64 {
+    x86_64::instructions::interrupts::disable();
     let fd = frame.rdi as usize;
     let buf = frame.rsi as *const u8;
     let len = frame.rdx as usize;
@@ -471,6 +546,21 @@ fn syscall_write(frame: &mut SyscallFrame) -> u64 {
         crate::fd::FdKind::Directory => (-21i64) as u64,
         crate::fd::FdKind::DevNull => len as u64,
         crate::fd::FdKind::DevZero => len as u64,
+        crate::fd::FdKind::Pipe => {
+            let pipe = {
+                let desc = entry.lock();
+                desc.pipe.as_ref().expect("Pipe fd must have pipe").clone()
+            };
+            let mut inner = pipe.lock();
+            if inner.read_ends == 0 {
+                return (-32i64) as u64; // EPIPE
+            }
+            let user_buf = unsafe { core::slice::from_raw_parts(buf, len) };
+            for &b in user_buf {
+                inner.buf.push_back(b);
+            }
+            len as u64
+        }
     };
     result
 }
@@ -729,6 +819,7 @@ fn syscall_fcntl(frame: &mut SyscallFrame) -> u64 {
 }
 
 fn syscall_fork(frame: &mut SyscallFrame) -> u64 {
+    x86_64::instructions::interrupts::disable();
     let sched = unsafe { &mut *&raw mut crate::SCHEDULER };
     let new_pid = sched.alloc_pid();
     let parent_idx = sched.current_idx();
@@ -740,6 +831,7 @@ fn syscall_fork(frame: &mut SyscallFrame) -> u64 {
 
     match child {
         Some(child) => {
+            let tls_phys = child.address_space.page_table.translate(0x687000);
             let child_pid = child.pid;
             let add_result = sched.add_process(child);
             add_result.expect("fork: no scheduler slot");
@@ -750,6 +842,7 @@ fn syscall_fork(frame: &mut SyscallFrame) -> u64 {
 }
 
 fn syscall_execve(frame: &mut SyscallFrame) -> u64 {
+    x86_64::instructions::interrupts::disable();
     let raw_path = match read_user_cstr(frame.rdi as *const u8, 256) {
         Some(p) => p,
         None => return (-14i64) as u64,
@@ -804,7 +897,7 @@ fn syscall_execve(frame: &mut SyscallFrame) -> u64 {
         Ok(e) => e,
         Err(e) => {
             crate::serial_println!("[syscall] execve: load failed: {}", e);
-            return (-8i64) as u64; // ENOEXEC
+            return (-8i64) as u64;
         }
     };
 
@@ -828,9 +921,6 @@ fn syscall_execve(frame: &mut SyscallFrame) -> u64 {
         let phoff = { ehdr.e_phoff };
         let phentsize = { ehdr.e_phentsize } as u64;
         let phnum = { ehdr.e_phnum } as u64;
-        // busybox は ET_EXEC で 0x400000 固定ロードのため PT_PHDR がない。
-        // AT_PHDR は auxv から除外済み（0 渡し）なので phdr_vaddr は実質未使用だが
-        // 将来的には PT_PHDR セグメントか PT_LOAD の p_vaddr + phoff で計算すべき。
         (0x400000u64 + phoff, phentsize, phnum)
     };
 
@@ -841,9 +931,8 @@ fn syscall_execve(frame: &mut SyscallFrame) -> u64 {
                 highest_end = vma.end;
             }
         }
-        let brk_start = (highest_end + 0xFFF) & !0xFFF;
-        p.brk_start = brk_start;
-        p.brk_current = brk_start;
+        p.brk_start = (highest_end + 0xFFF) & !0xFFF;
+        p.brk_current = p.brk_start;
     }
 
     let ustack_virt = 0x0000_7fff_0000u64;
@@ -873,7 +962,8 @@ fn syscall_execve(frame: &mut SyscallFrame) -> u64 {
             .ok();
     }
 
-    let new_rsp = build_argv_envp_stack(
+    // スタック構築（at_random を先に取得）
+    let (new_rsp, at_random) = build_argv_envp_stack(
         ustack_virt,
         &p.address_space.page_table,
         &argv,
@@ -883,23 +973,71 @@ fn syscall_execve(frame: &mut SyscallFrame) -> u64 {
         elf_phent,
         elf_phnum,
     );
+    let canary = u64::from_le_bytes(at_random[0..8].try_into().unwrap());
 
-    p.fs_base = 0;
-    unsafe {
-        crate::syscall::write_fs_base(0);
+    // 仮 TCB を設定
+    let tcb_page = 0x0000_7fff_1000u64;
+    let fs_base = tcb_page + 0x20;
+
+    let tcb_phys = {
+        let mut alloc = crate::ALLOCATOR.lock();
+        alloc.alloc_page().map(|(_, phys)| phys)
+    };
+    if let Some(tcb_phys) = tcb_phys {
+        let virt = crate::paging::phys_to_virt(tcb_phys.as_u64());
+        unsafe {
+            core::ptr::write_bytes(virt as *mut u8, 0, 0x1000);
+            let off = (fs_base & 0xFFF) as usize;
+            *((virt + off as u64) as *mut u64) = fs_base; // self ptr (offset 0x00)
+            *((virt + off as u64 + 0x10) as *mut u64) = fs_base; // dtv ptr (offset 0x10)
+            *((virt + off as u64 + 0x28) as *mut u64) = canary; // canary  (offset 0x28)
+        }
+
+        let canary_check = unsafe { *((virt + (fs_base & 0xFFF) as u64 + 0x28) as *const u64) };
+
+        {
+            let mut alloc = crate::ALLOCATOR.lock();
+            p.address_space
+                .page_table
+                .map(
+                    tcb_page,
+                    tcb_phys,
+                    crate::paging::PageFlags::PRESENT
+                        | crate::paging::PageFlags::WRITABLE
+                        | crate::paging::PageFlags::USER
+                        | crate::paging::PageFlags::NO_EXEC,
+                    &mut *alloc,
+                )
+                .expect("tcb map");
+        }
+        let _ = p.address_space.add_vma(crate::vma::VMA::new(
+            tcb_page,
+            tcb_page + 0x1000,
+            crate::vma::VMAFlags {
+                read: true,
+                write: true,
+                exec: false,
+            },
+            crate::vma::VMAKind::Anonymous,
+        ));
+
+        p.fs_base = fs_base;
+        unsafe {
+            write_fs_base(fs_base);
+        }
     }
 
     frame.rax = 0;
     frame.rbx = 0;
-    frame.rcx = entry; // RIP
-    frame.rdx = 0; // atexit pointer (0 = 登録なし)
+    frame.rcx = entry;
+    frame.rdx = 0;
     frame.rsi = 0;
     frame.rdi = 0;
     frame.rbp = 0;
     frame.r8 = 0;
     frame.r9 = 0;
     frame.r10 = 0;
-    frame.r11 = 0x202; // RFLAGS (割り込み許可)
+    frame.r11 = 0x202;
     frame.r12 = 0;
     frame.r13 = 0;
     frame.r14 = 0;
@@ -910,6 +1048,7 @@ fn syscall_execve(frame: &mut SyscallFrame) -> u64 {
 }
 
 fn syscall_wait4(frame: &mut SyscallFrame) -> u64 {
+    x86_64::instructions::interrupts::disable();
     let target_pid = frame.rdi as i32 as i64;
     let status_ptr = frame.rsi as *mut i32;
     let options = frame.rdx; // 第3引数: options (WNOHANG など)
@@ -923,13 +1062,11 @@ fn syscall_wait4(frame: &mut SyscallFrame) -> u64 {
         let zombie_idx = sched.processes.iter().enumerate().find_map(|(i, slot)| {
             slot.as_ref()
                 .filter(|p| {
-                    if p.parent_pid != caller_pid || p.state != crate::process::ProcessState::Dead {
-                        return false;
-                    }
-                    target_pid == -1
-                        || target_pid == 0
-                        || target_pid < -1
-                        || (p.pid as i64) == target_pid
+                    let parent_ok = p.parent_pid == caller_pid;
+                    let dead_ok = p.state == crate::process::ProcessState::Dead;
+                    let pid_ok = target_pid <= 0 || (p.pid as i64) == target_pid;
+
+                    parent_ok && dead_ok && pid_ok
                 })
                 .map(|_| i)
         });
@@ -967,9 +1104,14 @@ fn syscall_wait4(frame: &mut SyscallFrame) -> u64 {
             return 0;
         }
 
-        x86_64::instructions::interrupts::enable();
+        {
+            let idx = sched.current_idx();
+            if let Some(Some(p)) = sched.processes.get_mut(idx) {
+                p.state = ProcessState::Waiting;
+            }
+        }
+
         crate::process::schedule(&raw mut crate::SCHEDULER);
-        x86_64::instructions::interrupts::disable();
     }
 }
 
@@ -979,11 +1121,22 @@ fn syscall_exit(frame: &mut SyscallFrame) -> u64 {
     if let Some(p) = sched.current_mut() {
         p.exit_code = code;
         p.state = ProcessState::Dead;
+        // fd テーブルを全て close してパイプの参照カウントを下げる
+        for fd in 0..crate::fd::FD_MAX {
+            p.fd_table.close(fd);
+        }
+        let parent_pid = p.parent_pid;
+        for slot in sched.processes.iter_mut().flatten() {
+            if slot.pid == parent_pid && slot.state == ProcessState::Waiting {
+                slot.state = ProcessState::Ready;
+                break;
+            }
+        }
     }
-    x86_64::instructions::interrupts::enable();
-    crate::process::schedule(&raw mut crate::SCHEDULER);
 
+    crate::process::schedule(&raw mut crate::SCHEDULER);
     loop {
+        x86_64::instructions::interrupts::enable();
         x86_64::instructions::hlt();
     }
 }
@@ -1340,6 +1493,44 @@ fn syscall_arch_prctl(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
+fn syscall_pipe(frame: &mut SyscallFrame) -> u64 {
+    let fds_ptr = frame.rdi as *mut i32;
+
+    let (read_file, write_file) = {
+        let (r, w) = crate::pipe::new_pipe();
+        (
+            crate::fd::OpenFile::pipe_read(r),
+            crate::fd::OpenFile::pipe_write(w),
+        )
+    };
+
+    let sched = unsafe { &mut *&raw mut crate::SCHEDULER };
+    let p = match sched.current_mut() {
+        Some(p) => p,
+        None => return (-1i64) as u64,
+    };
+
+    let rfd = match p.fd_table.alloc(read_file) {
+        Some(fd) => fd,
+        None => return (-24i64) as u64,
+    };
+    let wfd = match p.fd_table.alloc(write_file) {
+        Some(fd) => fd,
+        None => {
+            p.fd_table.close(rfd);
+            return (-24i64) as u64;
+        }
+    };
+
+    let sched_ref = unsafe { &*&raw const crate::SCHEDULER };
+    let fds: [i32; 2] = [rfd as i32, wfd as i32];
+    write_to_user(sched_ref, fds_ptr as u64, unsafe {
+        core::slice::from_raw_parts(fds.as_ptr() as *const u8, 8)
+    });
+
+    0
+}
+
 pub(crate) unsafe fn write_fs_base(val: u64) {
     unsafe {
         core::arch::asm!(
@@ -1418,6 +1609,20 @@ fn syscall_writev(frame: &mut SyscallFrame) -> u64 {
             }
             crate::fd::FdKind::Directory => return (-21i64) as u64,
             crate::fd::FdKind::DevNull | crate::fd::FdKind::DevZero => total += buf.len(),
+            crate::fd::FdKind::Pipe => {
+                let pipe = {
+                    let desc = entry.lock();
+                    desc.pipe.as_ref().expect("Pipe fd must have pipe").clone()
+                };
+                let mut inner = pipe.lock();
+                if inner.read_ends == 0 {
+                    return (-32i64) as u64; // EPIPE
+                }
+                for &b in buf {
+                    inner.buf.push_back(b);
+                }
+                total += buf.len();
+            }
         }
     }
     total as u64
@@ -1729,9 +1934,7 @@ fn syscall_futex(frame: &mut SyscallFrame) -> u64 {
     match op {
         0 => {
             // FUTEX_WAIT: 一度スケジュールして戻る（ビジーウェイト軽減）
-            x86_64::instructions::interrupts::enable();
             crate::process::schedule(&raw mut crate::SCHEDULER);
-            x86_64::instructions::interrupts::disable();
             (-11i64) as u64 // EAGAIN
         }
         1 => 0, // FUTEX_WAKE
@@ -1870,7 +2073,7 @@ pub(crate) fn build_argv_envp_stack(
     elf_phdr_vaddr: u64,
     elf_phent: u64,
     elf_phnum: u64,
-) -> u64 {
+) -> (u64, [u8; 16]) {
     // ユーザー仮想アドレスへの書き込みを物理アドレス経由で行うヘルパー
     let write_u64 = |vaddr: u64, val: u64| {
         let phys = pt.translate(vaddr & !0xFFF).expect("stack not mapped");
@@ -2007,5 +2210,5 @@ pub(crate) fn build_argv_envp_stack(
     addr -= 8;
     write_u64(addr, argv.len() as u64);
 
-    addr
+    (addr, at_random_bytes)
 }

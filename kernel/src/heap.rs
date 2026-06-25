@@ -27,21 +27,12 @@ impl SlabCache {
             self.free_list = (*node).next;
             node as *mut u8
         } else {
-            crate::serial_println!(
-                "[heap/slab] alloc: size={} free list empty -> grow",
-                self.object_size
-            );
             self.grow()
         }
     }
 
     unsafe fn grow(&mut self) -> *mut u8 {
         use crate::allocator::PAGE_SIZE;
-
-        crate::serial_println!(
-            "[heap/slab] grow: size={} requesting new page from buddy",
-            self.object_size
-        );
 
         let phys = {
             let mut alloc = crate::ALLOCATOR.lock();
@@ -51,26 +42,16 @@ impl SlabCache {
         let base = match phys {
             Some(p) => {
                 let v = crate::paging::phys_to_virt(p.as_u64()) as usize;
-                crate::serial_println!(
-                    "[heap/slab] grow: size={} phys={:#x} virt={:#x}",
-                    self.object_size,
-                    p.as_u64(),
-                    v
-                );
+
                 v
             }
             None => {
-                crate::serial_println!(
-                    "[heap/slab] grow: size={} FAILED (buddy OOM)",
-                    self.object_size
-                );
                 return core::ptr::null_mut();
             }
         };
 
         core::ptr::write_bytes(base as *mut u8, 0, PAGE_SIZE);
 
-        let slots = PAGE_SIZE / self.object_size;
         let mut offset = self.object_size;
         while offset + self.object_size <= PAGE_SIZE {
             let node = (base + offset) as *mut FreeNode;
@@ -78,12 +59,6 @@ impl SlabCache {
             self.free_list = node;
             offset += self.object_size;
         }
-
-        crate::serial_println!(
-            "[heap/slab] grow: size={} added {} slots to free list",
-            self.object_size,
-            slots - 1
-        );
 
         base as *mut u8
     }
@@ -141,21 +116,12 @@ impl KernelHeap {
             use crate::allocator::PAGE_SIZE;
             let pages = size.div_ceil(PAGE_SIZE);
             let order = pages_to_order(pages);
-            crate::serial_println!(
-                "[heap] alloc: large size={} pages={} order={}",
-                size,
-                pages,
-                order
-            );
+
             let mut alloc = crate::ALLOCATOR.lock();
             match alloc.alloc(order) {
                 Some(p) => {
                     let v = crate::paging::phys_to_virt(p.as_u64()) as *mut u8;
-                    crate::serial_println!(
-                        "[heap] alloc: large phys={:#x} virt={:#x}",
-                        p.as_u64(),
-                        v as u64
-                    );
+
                     v
                 }
                 None => {
@@ -175,13 +141,7 @@ impl KernelHeap {
             let pages = size.div_ceil(PAGE_SIZE);
             let order = pages_to_order(pages);
             let phys = crate::paging::virt_to_phys(ptr as u64);
-            crate::serial_println!(
-                "[heap] dealloc: large ptr={:#x} phys={:#x} pages={} order={}",
-                ptr as u64,
-                phys,
-                pages,
-                order
-            );
+
             let mut alloc = crate::ALLOCATOR.lock();
             alloc.free(PhysAddr::new(phys), order);
         }

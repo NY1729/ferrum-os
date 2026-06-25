@@ -117,14 +117,6 @@ impl AddressSpace {
     }
 
     pub fn add_vma(&mut self, vma: VMA) -> Result<(), &'static str> {
-        crate::serial_println!(
-            "[vma] add_vma: [{:#x}, {:#x}) flags={:?} kind={:?}",
-            vma.start,
-            vma.end,
-            vma.flags,
-            vma.kind
-        );
-
         let idx = self.lower_bound(vma.start);
 
         // ソート済み・重なり無し不変条件があるので、前後2つだけ見れば
@@ -196,17 +188,8 @@ impl AddressSpace {
         allocator: &mut BuddyAllocator,
     ) -> Result<(), &'static str> {
         let page_addr = fault_addr & !((PAGE_SIZE as u64) - 1);
-        crate::serial_println!(
-            "[vma] handle_page_fault: fault_addr={:#x} page_addr={:#x}",
-            fault_addr,
-            page_addr
-        );
 
         if self.page_table.translate(page_addr).is_some() {
-            crate::serial_println!(
-                "[vma] handle_page_fault: page {:#x} already mapped, flushing TLB",
-                page_addr
-            );
             crate::paging::flush_tlb_page(page_addr);
             return Ok(());
         }
@@ -215,13 +198,6 @@ impl AddressSpace {
             .find_vma(fault_addr)
             .copied()
             .ok_or("No VMA for fault address")?;
-
-        crate::serial_println!(
-            "[vma] handle_page_fault: VMA [{:#x},{:#x}) flags={:?}",
-            vma.start,
-            vma.end,
-            vma.flags
-        );
 
         let phys = allocator.alloc(0).ok_or("Out of memory")?;
         crate::page_owner::track(phys.as_u64(), 0, vma.kind.owner_tag(), self.owner_pid);
@@ -237,11 +213,6 @@ impl AddressSpace {
 
         crate::paging::flush_tlb_page(page_addr);
 
-        crate::serial_println!(
-            "[vma] handle_page_fault: mapped page_addr={:#x} -> phys={:#x}",
-            page_addr,
-            phys.as_u64()
-        );
         Ok(())
     }
 
@@ -261,13 +232,7 @@ impl AddressSpace {
             align_up(addr, PAGE_SIZE as u64)
         };
         let end = align_up(start + (size as u64), PAGE_SIZE as u64);
-        crate::serial_println!(
-            "[vma] mmap: addr={:#x} size={:#x} -> [{:#x},{:#x})",
-            addr,
-            size,
-            start,
-            end
-        );
+
         self.add_vma(VMA::new(start, end, flags, kind))?;
         Ok(start)
     }
@@ -280,7 +245,6 @@ impl AddressSpace {
     ) -> Result<(), &'static str> {
         let start = align_up(addr, PAGE_SIZE as u64);
         let end = align_up(start + (size as u64), PAGE_SIZE as u64);
-        crate::serial_println!("[vma] munmap: [{:#x},{:#x})", start, end);
 
         self.remove_vma(start).ok_or("VMA not found")?;
 
@@ -292,7 +256,6 @@ impl AddressSpace {
             }
             page_addr += PAGE_SIZE as u64;
         }
-        crate::serial_println!("[vma] munmap: done");
         Ok(())
     }
 
@@ -421,13 +384,7 @@ impl AddressSpace {
     ) -> Result<u64, &'static str> {
         let start = align_up(addr, PAGE_SIZE as u64);
         let end = align_up(start + (size as u64), PAGE_SIZE as u64);
-        crate::serial_println!(
-            "[vma] mmap_fixed: addr={:#x} size={:#x} -> [{:#x},{:#x})",
-            addr,
-            size,
-            start,
-            end
-        );
+
         self.punch_hole(start, end, alloc)?;
         self.add_vma(VMA::new(start, end, flags, kind))?;
         Ok(start)

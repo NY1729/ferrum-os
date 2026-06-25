@@ -251,29 +251,6 @@ extern "sysv64" fn page_fault_inner(fault_addr: u64, error_code: u64, rip: u64) 
             fault_addr
         );
     }
-
-    serial_println!(
-        "[exception] PAGE FAULT @ {:#x} error_code={:#x} ({}{}{}) rip={:#x}",
-        fault_addr,
-        error_code,
-        if error_code & 2 != 0 {
-            "WRITE "
-        } else {
-            "READ "
-        },
-        if error_code & 4 != 0 {
-            "USER "
-        } else {
-            "KERNEL "
-        },
-        if error_code & 1 != 0 {
-            "PROT"
-        } else {
-            "NOTPRESENT"
-        },
-        rip,
-    );
-
     // 現在実行中のプロセスのアドレス空間で処理を試みる
     let result = {
         let sched = unsafe { &mut *&raw mut crate::SCHEDULER };
@@ -303,9 +280,7 @@ extern "sysv64" fn page_fault_inner(fault_addr: u64, error_code: u64, rip: u64) 
     };
 
     match result {
-        Ok(()) => {
-            serial_println!("[exception] PAGE FAULT @ {:#x}: handled OK", fault_addr);
-        }
+        Ok(()) => {}
         Err(e) => {
             // ユーザープロセスの不正アクセス → SIGSEGV 相当
             let sched = unsafe { &mut *&raw mut crate::SCHEDULER };
@@ -319,11 +294,16 @@ extern "sysv64" fn page_fault_inner(fault_addr: u64, error_code: u64, rip: u64) 
                     );
                     p.state = crate::process::ProcessState::Dead;
 
-                    x86_64::instructions::interrupts::enable();
+                    // fd テーブルを全て close してパイプの参照カウントを下げる
+                    for fd in 0..crate::fd::FD_MAX {
+                        p.fd_table.close(fd);
+                    }
+
                     crate::process::schedule(&raw mut crate::SCHEDULER);
 
                     // schedule が戻ってきた場合（Ready プロセスなし）は hlt で待つ
                     loop {
+                        x86_64::instructions::interrupts::enable();
                         x86_64::instructions::hlt();
                     }
                 }
@@ -389,8 +369,10 @@ extern "C" fn gp_fault_stub() {
         "push rsi", "push rdi", "push rbp",
         "push r8",  "push r9",  "push r10", "push r11",
         "push r12", "push r13", "push r14", "push r15",
-        "mov rdi, [rsp + 15*8]",  // error_code (ハードウェアが push 済み)
-        "mov rsi, [rsp + 16*8]",  // 元の RIP
+        "mov rdi, [rsp + 15*8]",   // error_code
+        "mov rsi, [rsp + 16*8]",   // faulting RIP
+        "mov rdx, [rsp + 17*8]",   // faulting CS  ← 追加
+        "mov rcx, [rsp + 19*8]",   // faulting RSP ← 追加
         "mov rbp, rsp",
         "and rsp, -16",
         "call {f}",
@@ -398,14 +380,25 @@ extern "C" fn gp_fault_stub() {
     );
 }
 
-extern "sysv64" fn gp_fault_inner(error_code: u64, faulting_rip: u64) -> ! {
+extern "sysv64" fn gp_fault_inner(
+    error_code: u64,
+    faulting_rip: u64,
+    faulting_cs: u64,
+    faulting_rsp: u64,
+) -> ! {
     serial_println!(
-        "[exception] GENERAL PROTECTION FAULT error_code={:#x} rip={:#x}",
+        "[exception] GENERAL PROTECTION FAULT error_code={:#x} rip={:#x} cs={:#x} rsp={:#x}",
         error_code,
-        faulting_rip
+        faulting_rip,
+        faulting_cs,
+        faulting_rsp
     );
+    let sched = unsafe { &mut *&raw mut crate::SCHEDULER };
+    if let Some(p) = sched.current_mut() {
+        serial_println!("[exception] #GP pid={} state={:?}", p.pid, p.state);
+    }
     panic!(
-        "[exception] #GP error_code={:#x} rip={:#x}",
-        error_code, faulting_rip
+        "[exception] #GP error_code={:#x} rip={:#x} cs={:#x}",
+        error_code, faulting_rip, faulting_cs
     );
 }

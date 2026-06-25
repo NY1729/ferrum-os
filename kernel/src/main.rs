@@ -15,6 +15,7 @@ mod interrupts;
 mod page_owner;
 mod paging;
 mod pic;
+mod pipe;
 mod process;
 mod spinlock;
 mod syscall;
@@ -29,11 +30,12 @@ use core::sync::atomic::Ordering;
 use fs::ramfs::Ramfs;
 use fs::vfs::Vfs;
 use paging::{map_identity, MemoryRegion, PageTableManager};
+use spin::mutex::SpinMutex;
 use spinlock::IrqMutex;
 use uefi::mem::memory_map::MemoryMap;
 
 pub static ROOTFS: IrqMutex<Ramfs> = IrqMutex::new(Ramfs::new());
-static ALLOCATOR: IrqMutex<BuddyAllocator> = IrqMutex::new(BuddyAllocator::new());
+pub static ALLOCATOR: SpinMutex<BuddyAllocator> = SpinMutex::new(BuddyAllocator::new());
 static ADDRESS_SPACE: IrqMutex<Option<AddressSpace>> = IrqMutex::new(None);
 static mut SCHEDULER: process::Scheduler = process::Scheduler::new();
 
@@ -272,7 +274,7 @@ fn start_scheduler(image_size: u64) {
                 paging::map_kernel_image(&mut as_.page_table, image_base_phys, image_size);
                 paging::sync_higher_half(as_.page_table.pml4_phys().as_u64(), src_pml4);
 
-                let proc = process::Process::new_user_with_address_space(
+                let mut proc = process::Process::new_user_with_address_space(
                     1,
                     entry,
                     kstack_virt,
@@ -293,6 +295,19 @@ fn start_scheduler(image_size: u64) {
                     as_,
                 )
                 .expect("new_user_with_address_space");
+
+                {
+                    let mut highest_end = 0u64;
+                    for vma in proc.address_space.vmas.iter() {
+                        if vma.kind != crate::vma::VMAKind::Stack && vma.end > highest_end {
+                            highest_end = vma.end;
+                        }
+                    }
+                    let brk_start = (highest_end + 0xFFF) & !0xFFF;
+                    proc.brk_start = brk_start;
+                    proc.brk_current = brk_start;
+                    crate::serial_println!("[init] brk_start={:#x}", brk_start);
+                }
 
                 (&raw mut SCHEDULER)
                     .as_mut()

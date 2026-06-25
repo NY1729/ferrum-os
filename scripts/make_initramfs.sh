@@ -1,14 +1,3 @@
-#!/usr/bin/env bash
-# make_initramfs.sh
-# ferrum-os の target/esp に initramfs.cpio を生成する。
-#
-# 使い方:
-#   ./scripts/make_initramfs.sh
-#
-# 前提:
-#   - binaries/busybox がビルド済み（static ELF）
-#   - ferrum-os リポジトリルートから実行する
-
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
