@@ -72,21 +72,14 @@ impl Ramfs {
             entries: Vec::new(),
         }
     }
-    pub fn list_dir(&self, dir: &str) -> Vec<String> {
-        let prefix = if dir == "/" {
-            String::from("/")
-        } else {
-            alloc::format!("{}/", dir)
-        };
-        let mut names = Vec::new();
-        for e in &self.entries {
-            if let Some(rest) = e.path.strip_prefix(prefix.as_str()) {
-                if !rest.is_empty() && !rest.contains('/') {
-                    names.push(String::from(rest));
-                }
-            }
-        }
-        names
+    pub fn rename(&mut self, old: &str, new: &str) -> Result<(), &'static str> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.path == old)
+            .ok_or("not found")?;
+        entry.path = String::from(new);
+        Ok(())
     }
 }
 
@@ -120,6 +113,50 @@ impl Vfs for Ramfs {
                 data: data.to_vec(),
             })),
         });
+        Ok(())
+    }
+
+    fn list_dir(&self, dir: &str) -> Vec<String> {
+        // 既存のメソッドをトレイト経由で呼べるようにする
+        // （元々 inherent method だった list_dir をトレイトに移す）
+        let prefix = if dir == "/" {
+            String::from("/")
+        } else {
+            alloc::format!("{}/", dir)
+        };
+        let mut names = Vec::new();
+        for e in &self.entries {
+            if let Some(rest) = e.path.strip_prefix(prefix.as_str()) {
+                if !rest.is_empty() && !rest.contains('/') {
+                    names.push(String::from(rest));
+                }
+            }
+        }
+        names
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<(), &'static str> {
+        // 既に同パスのエントリがあればOK
+        if self.entries.iter().any(|e| e.path == path) {
+            return Ok(());
+        }
+        // ディレクトリエントリとして空ファイルを登録
+        self.entries.push(Entry {
+            path: String::from(path),
+            node: Arc::new(IrqMutex::new(RamfsNode {
+                file_type: FileType::Directory,
+                data: Vec::new(),
+            })),
+        });
+        Ok(())
+    }
+    fn unlink(&mut self, path: &str) -> Result<(), &'static str> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|e| e.path == path)
+            .ok_or("not found")?;
+        self.entries.remove(pos);
         Ok(())
     }
 }

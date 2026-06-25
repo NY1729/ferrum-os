@@ -31,4 +31,14 @@ pub trait Vfs: Send + Sync {
     fn open(&self, path: &str) -> Option<alloc::boxed::Box<dyn VfsNode>>;
     fn create(&mut self, path: &str, file_type: FileType) -> Result<(), &'static str>;
     fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), &'static str>;
+    fn list_dir(&self, dir: &str) -> alloc::vec::Vec<alloc::string::String>;
+
+    // initramfs展開用
+    fn mkdir(&mut self, path: &str) -> Result<(), &'static str>;
+    fn symlink(&mut self, path: &str, target: &str) -> Result<(), &'static str> {
+        // デフォルト実装: 無視（RAMFSがsymlink未対応の場合）
+        let _ = (path, target);
+        Ok(())
+    }
+    fn unlink(&mut self, path: &str) -> Result<(), &'static str>;
 }

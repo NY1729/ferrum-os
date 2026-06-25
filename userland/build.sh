@@ -15,10 +15,10 @@ cargo build --release --target x86_64-unknown-none \
     --bin dev_test
 
 # コピー
-cp target/x86_64-unknown-none/release/init ../binaries/user.elf
-cp target/x86_64-unknown-none/release/cat ../binaries/cat.elf
-cp target/x86_64-unknown-none/release/echo ../binaries/echo.elf
-cp target/x86_64-unknown-none/release/mmap_test ../binaries/mmap_test.elf
-cp target/x86_64-unknown-none/release/dev_test ../binaries/dev_test.elf
+cp ../target/x86_64-unknown-none/release/init ../binaries/user.elf
+cp ../target/x86_64-unknown-none/release/cat ../binaries/cat.elf
+cp ../target/x86_64-unknown-none/release/echo ../binaries/echo.elf
+cp ../target/x86_64-unknown-none/release/mmap_test ../binaries/mmap_test.elf
+cp ../target/x86_64-unknown-none/release/dev_test ../binaries/dev_test.elf
 
 echo "✅ Userland build completed."

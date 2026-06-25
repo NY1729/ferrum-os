@@ -328,7 +328,6 @@ impl PageTableManager {
 
     pub fn unmap(&mut self, virt: u64) -> Option<PhysAddr> {
         let parts = VirtAddrParts::from_u64(virt);
-        crate::serial_println!("[paging] unmap: virt={:#x}", virt);
         unsafe {
             let pml4 = &mut *(phys_to_virt(self.pml4_phys.as_u64()) as *mut PageTable);
             let e = &pml4.entries[parts.pml4];

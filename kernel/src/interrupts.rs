@@ -227,23 +227,52 @@ extern "C" fn page_fault_stub() {
         "push rsi", "push rdi", "push rbp",
         "push r8",  "push r9",  "push r10", "push r11",
         "push r12", "push r13", "push r14", "push r15",
-        "mov rdi, cr2",
+        "mov rdi, cr2",             // arg1: fault_addr
+        "mov rsi, [rsp + 15*8]",    // arg2: error_code
+        "mov rdx, [rsp + 16*8]",    // arg3: faulting RIP
         "sub rsp, 8",
         "call {f}",
         "add rsp, 8",
-        "pop r15", "pop r14", "pop r13", "pop r12", // レジスタ復元
+        "pop r15", "pop r14", "pop r13", "pop r12",
         "pop r11",  "pop r10", "pop r9",  "pop r8",
         "pop rbp",
         "pop rdi",  "pop rsi",
         "pop rdx",  "pop rcx", "pop rbx", "pop rax",
-        "add rsp, 8",
+        "add rsp, 8",   // error_code をスキップ
         "iretq",
         f = sym page_fault_inner,
     );
 }
 
-extern "sysv64" fn page_fault_inner(fault_addr: u64) {
-    serial_println!("[exception] PAGE FAULT @ {:#x}", fault_addr);
+extern "sysv64" fn page_fault_inner(fault_addr: u64, error_code: u64, rip: u64) {
+    if fault_addr >= 0xffff_8000_0000_0000 {
+        panic!(
+            "[exception] KERNEL PAGE FAULT @ {:#x} (kernel stack overflow?)",
+            fault_addr
+        );
+    }
+
+    serial_println!(
+        "[exception] PAGE FAULT @ {:#x} error_code={:#x} ({}{}{}) rip={:#x}",
+        fault_addr,
+        error_code,
+        if error_code & 2 != 0 {
+            "WRITE "
+        } else {
+            "READ "
+        },
+        if error_code & 4 != 0 {
+            "USER "
+        } else {
+            "KERNEL "
+        },
+        if error_code & 1 != 0 {
+            "PROT"
+        } else {
+            "NOTPRESENT"
+        },
+        rip,
+    );
 
     // 現在実行中のプロセスのアドレス空間で処理を試みる
     let result = {

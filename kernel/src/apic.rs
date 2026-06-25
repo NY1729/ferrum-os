@@ -15,6 +15,7 @@ const LAPIC_SVR_ENABLE: u32 = 1 << 8;
 const LAPIC_TIMER_PERIODIC: u32 = 1 << 17;
 
 static LAPIC_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static COUNTS_PER_10MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn init() {
     crate::serial_println!("[apic] init: begin");
@@ -164,6 +165,10 @@ pub fn calibrate_timer(vector: u8) -> u32 {
         "[apic] calibrate_timer: counts_per_10ms={} (~{} MHz)",
         counts_per_10ms,
         counts_per_10ms / 10_000
+    );
+    COUNTS_PER_10MS.store(
+        counts_per_10ms as u64,
+        core::sync::atomic::Ordering::Relaxed,
     );
 
     // 周期モード 100 Hz（10ms 周期）

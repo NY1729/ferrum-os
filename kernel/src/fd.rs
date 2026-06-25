@@ -19,6 +19,7 @@ pub struct OpenFile {
     pub kind: FdKind,
     pub readable: bool,
     pub writable: bool,
+    pub append: bool,
     pub node: Option<Box<dyn VfsNode>>,
     pub offset: usize,
     pub dir_entries: Option<alloc::vec::Vec<alloc::string::String>>,
@@ -29,7 +30,8 @@ impl OpenFile {
         Self {
             kind: FdKind::Serial,
             readable: true,
-            writable: false,
+            writable: true,
+            append: false,
             node: None,
             offset: 0,
             dir_entries: None,
@@ -38,18 +40,20 @@ impl OpenFile {
     pub fn stdout() -> Self {
         Self {
             kind: FdKind::Serial,
-            readable: false,
+            readable: true,
             writable: true,
+            append: false,
             node: None,
             offset: 0,
             dir_entries: None,
         }
     }
-    pub fn file(node: Box<dyn VfsNode>, readable: bool, writable: bool) -> Self {
+    pub fn file(node: Box<dyn VfsNode>, readable: bool, writable: bool, append: bool) -> Self {
         Self {
             kind: FdKind::File,
             readable,
             writable,
+            append,
             node: Some(node),
             offset: 0,
             dir_entries: None,
@@ -60,6 +64,7 @@ impl OpenFile {
             kind,
             readable: true,
             writable: true,
+            append: false,
             node: None,
             offset: 0,
             dir_entries: None,
@@ -70,6 +75,7 @@ impl OpenFile {
             kind: FdKind::Directory,
             readable: true,
             writable: false,
+            append: false,
             node: None,
             offset: 0,
             dir_entries: Some(entries),
@@ -122,5 +128,30 @@ impl FdTable {
             t.entries[i] = slot.clone();
         }
         t
+    }
+    pub fn alloc_entry(&mut self, entry: FdEntry) -> Option<usize> {
+        let (i, slot) = self
+            .entries
+            .iter_mut()
+            .enumerate()
+            .find(|(_, s)| s.is_none())?;
+        *slot = Some(entry);
+        Some(i)
+    }
+    pub fn alloc_from(&mut self, entry: FdEntry, minfd: usize) -> Option<usize> {
+        let (i, slot) = self
+            .entries
+            .iter_mut()
+            .enumerate()
+            .skip(minfd)
+            .find(|(_, s)| s.is_none())?;
+        *slot = Some(entry);
+        Some(i)
+    }
+
+    pub fn put(&mut self, fd: usize, entry: FdEntry) {
+        if fd < FD_MAX {
+            self.entries[fd] = Some(entry);
+        }
     }
 }

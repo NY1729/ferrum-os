@@ -90,6 +90,7 @@ impl BuddyAllocator {
     }
 
     pub fn alloc(&mut self, order: usize) -> Option<PhysAddr> {
+        #[cfg(debug_assertions)]
         self.check_metadata_integrity("alloc_start");
 
         let found_order = (order..MAX_ORDER).find(|&o| self.free_counts[o] > 0)?;
@@ -102,11 +103,13 @@ impl BuddyAllocator {
             self.push_block(buddy, current_order);
         }
 
+        #[cfg(debug_assertions)]
         self.check_metadata_integrity("alloc_end");
         Some(block)
     }
 
     pub fn free(&mut self, addr: PhysAddr, order: usize) {
+        #[cfg(debug_assertions)]
         self.check_metadata_integrity("free_start");
 
         let mut current_addr = addr;
@@ -122,12 +125,16 @@ impl BuddyAllocator {
         }
 
         self.push_block(current_addr, current_order);
+        #[cfg(debug_assertions)]
         self.check_metadata_integrity("free_end");
     }
 
     fn push_block(&mut self, addr: PhysAddr, order: usize) {
         if addr.as_u64() == 0 {
-            panic!("[FATAL] Pushing NULL (0) to BuddyAllocator! Order={}", order);
+            panic!(
+                "[FATAL] Pushing NULL (0) to BuddyAllocator! Order={}",
+                order
+            );
         }
         Self::write_next(addr.as_u64(), self.free_heads[order]);
         self.free_heads[order] = addr.as_u64();
@@ -136,7 +143,11 @@ impl BuddyAllocator {
 
     fn pop_block(&mut self, order: usize) -> PhysAddr {
         let addr = self.free_heads[order];
-        debug_assert!(addr != 0, "[buddy] pop_block on empty list (order {})", order);
+        debug_assert!(
+            addr != 0,
+            "[buddy] pop_block on empty list (order {})",
+            order
+        );
         let next = Self::read_next(addr);
         self.free_heads[order] = next;
         self.free_counts[order] -= 1;
@@ -169,7 +180,11 @@ impl BuddyAllocator {
         crate::serial_println!("[buddy] dump:");
         for order in 0..MAX_ORDER {
             if self.free_counts[order] > 0 {
-                crate::serial_println!("[buddy]   order {:2}: {:4} blocks", order, self.free_counts[order]);
+                crate::serial_println!(
+                    "[buddy]   order {:2}: {:4} blocks",
+                    order,
+                    self.free_counts[order]
+                );
             }
         }
     }
@@ -184,7 +199,9 @@ fn buddy_of(addr: PhysAddr, order: usize) -> PhysAddr {
 fn max_order_for(addr: u64, remaining: usize) -> usize {
     (0..MAX_ORDER)
         .rev()
-        .find(|&o| order_to_size(o) <= remaining && ((addr / (PAGE_SIZE as u64)) & ((1 << o) - 1)) == 0)
+        .find(|&o| {
+            order_to_size(o) <= remaining && ((addr / (PAGE_SIZE as u64)) & ((1 << o) - 1)) == 0
+        })
         .unwrap_or(0)
 }
 fn align_up(addr: u64, align: u64) -> u64 {

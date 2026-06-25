@@ -7,7 +7,6 @@
 *.o
 *.bin
 *.efi
-busybox
 *.img
 *.iso
 

@@ -191,6 +191,10 @@ impl Process {
         ustack_pages: usize,
         argv: &[alloc::string::String],
         envp: &[alloc::string::String],
+        elf_entry: u64,
+        elf_phdr_vaddr: u64,
+        elf_phent: u64,
+        elf_phnum: u64,
         mut address_space: AddressSpace,
     ) -> Option<Self> {
         {
@@ -216,7 +220,16 @@ impl Process {
                 .ok()?;
         }
 
-        let initial_rsp = crate::syscall::build_argv_envp_stack(ustack_virt, argv, envp);
+        let initial_rsp = crate::syscall::build_argv_envp_stack(
+            ustack_virt,
+            &address_space.page_table,
+            argv,
+            envp,
+            elf_entry,
+            elf_phdr_vaddr,
+            elf_phent,
+            elf_phnum,
+        );
 
         let kstack_top = (kstack as u64) + (kstack_len as u64);
         unsafe {
@@ -325,13 +338,12 @@ impl Process {
             .page_table
             .pml4_phys();
 
-        let mut child_pt = {
+        let child_pt = {
             let mut alloc = crate::ALLOCATOR.lock();
             PageTableManager::new_user(kernel_pml4, &mut *alloc, new_pid)?
         };
 
-        let mut child_as =
-            AddressSpace::new(PageTableManager::from_phys(child_pt.pml4_phys()), new_pid);
+        let mut child_as = AddressSpace::new(child_pt, new_pid);
 
         // 親のユーザーページをコピー
         {
@@ -341,12 +353,6 @@ impl Process {
                 let mut addr = vma.start;
                 while addr < vma.end {
                     if let Some(src_phys) = self.address_space.page_table.translate(addr) {
-                        crate::serial_println!(
-                            "[fork] copying virt={:#x} src_phys={:#x}",
-                            addr,
-                            src_phys.as_u64()
-                        );
-
                         let (_, dst_phys) = alloc.alloc_page().expect("fork: OOM during copy");
                         crate::page_owner::track(
                             dst_phys.as_u64(),
@@ -367,15 +373,10 @@ impl Process {
                         unsafe {
                             core::ptr::copy_nonoverlapping(src, dst, 4096);
                         }
-                        child_pt
+                        child_as
+                            .page_table
                             .map(addr, dst_phys, vma.flags.to_page_flags(), &mut *alloc)
-                            .expect("fork: child_pt.map failed");
-
-                        crate::serial_println!(
-                            "[fork] mapped virt={:#x} -> dst_phys={:#x}",
-                            addr,
-                            dst_phys.as_u64()
-                        );
+                            .expect("fork: child_as.page_table.map failed");
                     }
                     addr += 0x1000;
                 }
@@ -384,12 +385,10 @@ impl Process {
 
         // カーネルイメージを子の PML4 にもマップ（syscall/do_switch アクセス用）
         unsafe {
-            let parent_table = crate::paging::phys_to_virt(self.pml4_phys().as_u64())
-                as *const crate::paging::PageTable;
-            let child_table = crate::paging::phys_to_virt(child_as.page_table.pml4_phys().as_u64())
+            let parent_table =
+                phys_to_virt(self.pml4_phys().as_u64()) as *const crate::paging::PageTable;
+            let child_table = phys_to_virt(child_as.page_table.pml4_phys().as_u64())
                 as *mut crate::paging::PageTable;
-
-            // カーネル領域 (Higher Half: 256-511) を直接コピー
             for i in 256..512 {
                 (*child_table).entries[i] = (*parent_table).entries[i];
             }
@@ -488,23 +487,8 @@ impl Scheduler {
     }
 
     pub fn add_process(&mut self, p: Process) -> Option<()> {
-        crate::serial_println!("[sched] add_process: called for pid={}", p.pid);
         for (i, slot) in self.processes.iter_mut().enumerate() {
-            let is_free = match slot {
-                None => true,
-                Some(existing) => existing.state == ProcessState::Dead,
-            };
-            if is_free {
-                if let Some(mut old) = slot.take() {
-                    if old.state == ProcessState::Dead {
-                        let mut alloc = crate::ALLOCATOR.lock();
-                        old.address_space.destroy(&mut alloc);
-                        if let Some((kphys, order)) = old.kernel_stack_alloc {
-                            alloc.free(kphys, order);
-                            crate::page_owner::untrack(kphys.as_u64());
-                        }
-                    }
-                }
+            if slot.is_none() {
                 crate::serial_println!("[sched] add: pid={} slot[{}]", p.pid, i);
                 *slot = Some(p);
                 return Some(());
